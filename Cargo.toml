@@ -1,0 +1,15 @@
+[package]
+name    = "game-of-life"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.9"   # match whatever version your crate already uses
+
+[[bench]]
+name = "clock"
+harness = false
+
+[dependencies]
+rand = { version = "0.9.2" }
