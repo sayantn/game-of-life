@@ -1,12 +1,11 @@
 use std::fmt::{self, Debug};
-use std::iter;
-use std::str::FromStr;
+use std::ops::{BitOr, Index, IndexMut};
 
 use rand::Rng;
 
 use crate::row::*;
 
-pub const SIZE: usize = 8 * ROW_BYTES;
+pub const SIZE: usize = ROW_BITS;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -39,40 +38,106 @@ impl Chunk {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.iter().any(|&row| row != empty_row())
+        for block in self.data.chunks_exact(16) {
+            if block.iter().copied().reduce(Row::bitor).unwrap() != empty_row() {
+                return false;
+            }
+        }
+        true
     }
 
-    pub fn apply_rules(&self, nbhd: Neighbourhood<'_>, dst: &mut Self) {
-        let mut top_row = RowDigest::new(
-            nbhd.n.data[SIZE - 1],
-            nbhd.nw.data[SIZE - 1],
-            nbhd.ne.data[SIZE - 1],
-        );
-        let mut current_row = RowDigest::new(self.data[0], nbhd.w.data[0], nbhd.e.data[0]);
+    pub fn apply_rules(&self, nbhd: NeighborData<&Chunk>, dst: &mut Self) -> [bool; 3] {
+        let left = &nbhd[Dir::W].data;
+        let right = &nbhd[Dir::E].data;
 
-        for (i, bottom_row) in (1..SIZE)
-            .map(|i| (self.data[i], nbhd.w.data[i], nbhd.e.data[i]))
-            .chain(iter::once((
-                nbhd.s.data[0],
-                nbhd.sw.data[0],
-                nbhd.se.data[0],
-            )))
-            .map(|(row, left, right)| RowDigest::new(row, left, right))
-            .enumerate()
-        {
-            dst.data[i] = rule(
+        let mut top_row = RowDigest::new(
+            nbhd[Dir::N].data[SIZE - 1],
+            nbhd[Dir::NW].data[SIZE - 1],
+            nbhd[Dir::NE].data[SIZE - 1],
+        );
+        let mut current_row = RowDigest::new(self.data[0], left[0], right[0]);
+        let mut acc = empty_row();
+
+        for i in 0..SIZE - 1 {
+            let bottom_row = RowDigest::new(self.data[i + 1], left[i + 1], right[i + 1]);
+            let result = rule(
                 top_row.triplet,
                 current_row.doublet,
                 bottom_row.triplet,
                 current_row.row,
             );
-
-            (top_row, current_row) = (current_row, bottom_row);
+            dst.data[i] = result;
+            acc |= result;
+            top_row = current_row;
+            current_row = bottom_row;
         }
+
+        let bottom_row = RowDigest::new(
+            nbhd[Dir::S].data[0],
+            nbhd[Dir::SW].data[0],
+            nbhd[Dir::SE].data[0],
+        );
+        let result = rule(
+            top_row.triplet,
+            current_row.doublet,
+            bottom_row.triplet,
+            current_row.row,
+        );
+        dst.data[SIZE - 1] = result;
+        acc |= result;
+
+        [leftmost_col(acc), acc != empty_row(), rightmost_col(acc)]
     }
 
-    pub fn check_activity(_nbhd: &Neighbourhood<'_>, _dst: &mut Self) {
-        todo!()
+    pub(crate) fn is_top_active(&self) -> bool {
+        self.data[0] != empty_row()
+    }
+
+    pub(crate) fn is_bottom_active(&self) -> bool {
+        self.data[SIZE - 1] != empty_row()
+    }
+
+    pub fn check_activity(nbhd: NeighborData<&Chunk>, dst: &mut Self) -> [bool; 3] {
+        let left = &nbhd[Dir::W].data;
+        let right = &nbhd[Dir::E].data;
+
+        let mut top_row = RowDigest::new(
+            nbhd[Dir::N].data[SIZE - 1],
+            nbhd[Dir::NW].data[SIZE - 1],
+            nbhd[Dir::NE].data[SIZE - 1],
+        );
+        let mut current_row = RowDigest::new(empty_row(), left[0], right[0]);
+        let mut acc = empty_row();
+
+        for i in 0..SIZE - 1 {
+            let bottom_row = RowDigest::new(empty_row(), left[i + 1], right[i + 1]);
+            let result = rule(
+                top_row.triplet,
+                current_row.doublet,
+                bottom_row.triplet,
+                current_row.row,
+            );
+            dst.data[i] = result;
+            acc |= result;
+            top_row = current_row;
+            current_row = bottom_row;
+        }
+
+        let bottom_row = RowDigest::new(
+            nbhd[Dir::S].data[0],
+            nbhd[Dir::SW].data[0],
+            nbhd[Dir::SE].data[0],
+        );
+        let result = rule(
+            top_row.triplet,
+            current_row.doublet,
+            bottom_row.triplet,
+            current_row.row,
+        );
+        dst.data[SIZE - 1] = result;
+        acc |= result;
+
+        [leftmost_col(acc), acc != empty_row(), rightmost_col(acc)]
     }
 }
 
@@ -81,129 +146,105 @@ impl Debug for Chunk {
         let mut line = [b'\n'; SIZE + 1];
         for row in self.data {
             let bytes = row_to_bytes(row);
-            for (j, slot) in line[1..].iter_mut().enumerate() {
+            for (j, slot) in line[..SIZE].iter_mut().enumerate() {
                 let bit = bytes[j / 8] & (0x80 >> (j % 8));
                 *slot = if bit != 0 { b'#' } else { b'.' };
             }
-            f.write_str(std::str::from_utf8(&line).unwrap())?;
+            f.write_str(str::from_utf8(&line).unwrap())?;
         }
         Ok(())
     }
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Neighbourhood<'a> {
-    pub nw: &'a Chunk,
-    pub n: &'a Chunk,
-    pub ne: &'a Chunk,
-    pub w: &'a Chunk,
-    pub e: &'a Chunk,
-    pub sw: &'a Chunk,
-    pub s: &'a Chunk,
-    pub se: &'a Chunk,
+pub enum Dir {
+    NW,
+    N,
+    NE,
+    W,
+    E,
+    SW,
+    S,
+    SE,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseError {
-    WrongRowCount {
-        expected: usize,
-        found: usize,
-    },
-    WrongRowLength {
-        row: usize,
-        expected: usize,
-        found: usize,
-    },
-    RaggedRow {
-        row: usize,
-        expected: usize,
-        found: usize,
-    },
-    InvalidCell {
-        row: usize,
-        col: usize,
-        found: char,
-    },
-}
+impl Dir {
+    pub const ALL: [Dir; 8] = [
+        Dir::NW,
+        Dir::N,
+        Dir::NE,
+        Dir::W,
+        Dir::E,
+        Dir::SW,
+        Dir::S,
+        Dir::SE,
+    ];
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::WrongRowCount { expected, found } => {
-                write!(f, "expected at most {expected} rows, found {found}")
-            }
-            Self::WrongRowLength {
-                row,
-                expected,
-                found,
-            } => {
-                write!(
-                    f,
-                    "row {row}: expected at most {expected} cells, found {found}"
-                )
-            }
-            Self::RaggedRow {
-                row,
-                expected,
-                found,
-            } => {
-                write!(f, "row {row}: expected {expected} cells, found {found}")
-            }
-            Self::InvalidCell { row, col, found } => {
-                write!(f, "row {row}, column {col}: invalid cell {found:?}")
-            }
+    #[inline]
+    pub fn opposite(self) -> Dir {
+        Dir::ALL[7 - self as usize]
+    }
+
+    #[inline]
+    pub fn offset(self) -> (i64, i64) {
+        match self {
+            Dir::NW => (-1, -1),
+            Dir::N => (0, -1),
+            Dir::NE => (1, -1),
+            Dir::W => (-1, 0),
+            Dir::E => (1, 0),
+            Dir::SW => (-1, 1),
+            Dir::S => (0, 1),
+            Dir::SE => (1, 1),
+        }
+    }
+
+    #[inline]
+    pub fn from_offset(dx: i64, dy: i64) -> Self {
+        match (dx, dy) {
+            (-1, -1) => Dir::NW,
+            (0, -1) => Dir::N,
+            (1, -1) => Dir::NE,
+            (-1, 0) => Dir::W,
+            (1, 0) => Dir::E,
+            (-1, 1) => Dir::SW,
+            (0, 1) => Dir::S,
+            (1, 1) => Dir::SE,
+            _ => panic!("({dx}, {dy}) is not a direction"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeighborData<T>([T; 8]);
 
-impl FromStr for Chunk {
-    type Err = ParseError;
+impl<T> Index<Dir> for NeighborData<T> {
+    type Output = T;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let lines: Vec<&str> = s.lines().collect();
+    #[inline]
+    fn index(&self, index: Dir) -> &Self::Output {
+        &self.0[index as usize]
+    }
+}
 
-        if lines.len() > SIZE {
-            return Err(ParseError::WrongRowCount {
-                expected: SIZE,
-                found: lines.len(),
-            });
-        }
+impl<T> IndexMut<Dir> for NeighborData<T> {
+    #[inline]
+    fn index_mut(&mut self, index: Dir) -> &mut Self::Output {
+        &mut self.0[index as usize]
+    }
+}
 
-        // Every row must have this width. An empty input has width 0.
-        let width = lines.first().map_or(0, |l| l.chars().count());
-        if width > SIZE {
-            return Err(ParseError::WrongRowLength {
-                row: 0,
-                expected: SIZE,
-                found: width,
-            });
-        }
+impl<T> NeighborData<T> {
+    pub fn from_fn(f: impl FnMut(Dir) -> T) -> Self {
+        Self(Dir::ALL.map(f))
+    }
 
-        // Zero-initialised, so rows and columns outside the input stay dead.
-        let mut bytes = [[0u8; ROW_BYTES]; SIZE];
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> NeighborData<U> {
+        NeighborData(self.0.map(f))
+    }
 
-        for (r, line) in lines.iter().enumerate() {
-            // Check the width before indexing, so `col < width <= COLS` holds below.
-            let len = line.chars().count();
-            if len != width {
-                return Err(ParseError::RaggedRow {
-                    row: r,
-                    expected: width,
-                    found: len,
-                });
-            }
-
-            for (col, c) in line.chars().enumerate() {
-                match c {
-                    '#' => bytes[r][col / 8] |= 0x80 >> (col % 8),
-                    '.' => {}
-                    found => return Err(ParseError::InvalidCell { row: r, col, found }),
-                }
-            }
-        }
-
-        Ok(Self::from_bytes(bytes))
+    pub fn iter(&self) -> impl Iterator<Item = (Dir, &T)> {
+        Dir::ALL.into_iter().zip(&self.0)
     }
 }

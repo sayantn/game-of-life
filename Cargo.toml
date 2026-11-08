@@ -12,4 +12,5 @@ name = "clock"
 harness = false
 
 [dependencies]
+fxhash = "0.2.1"
 rand = { version = "0.9.2" }

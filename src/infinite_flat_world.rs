@@ -1,201 +1,247 @@
-use crate::cell::Cell::{self, *};
-use std::{collections::HashMap, ops::Index};
+use std::mem;
+use std::ops::Index;
 
-use crate::oldchunk::{Chunk, MASK_X, MASK_Y, SHIFT_X, SHIFT_Y};
+use fxhash::{FxHashMap, FxHashSet};
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct InfiniteFlatWorld {
-    pub active_chunks: HashMap<(i128, i128), Chunk>,
+use crate::arena::{Arena, ChunkRef};
+use crate::chunk::{Chunk, Dir, NeighborData};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Coord {
+    pub x: i64,
+    pub y: i64,
 }
 
-impl Index<(i128, i128)> for InfiniteFlatWorld {
-    type Output = Cell;
-
-    fn index(&self, (x, y): (i128, i128)) -> &Self::Output {
-        let chunk_coords = (x >> SHIFT_X, y >> SHIFT_Y);
-        self.active_chunks
-            .get(&chunk_coords)
-            .map(|chunk| &chunk[(x as usize & MASK_X, y as usize & MASK_Y)])
-            .unwrap_or(&Dead)
+impl Coord {
+    fn step(self, dir: Dir) -> Self {
+        let (dx, dy) = dir.offset();
+        Self {
+            x: self.x + dx,
+            y: self.y + dy,
+        }
     }
+}
+
+type Links = NeighborData<Option<usize>>;
+
+#[derive(Clone, Copy)]
+struct Meta {
+    coord: Coord,
+    links: Links,
+    edge_activity: [bool; 2],
+}
+
+pub struct InfiniteFlatWorld {
+    arena: Arena,
+
+    current: Vec<ChunkRef>,
+    next: Vec<ChunkRef>,
+
+    meta: Vec<Meta>,
+
+    index: FxHashMap<Coord, usize>,
+    empty: Box<Chunk>,
+
+    dying: Vec<usize>,
+    still_dead: FxHashSet<Coord>,
+    newborn: FxHashMap<Coord, (ChunkRef, [bool; 2])>,
+}
+
+fn add(a: (i64, i64), b: (i64, i64)) -> (i64, i64) {
+    (a.0 + b.0, a.1 + b.1)
 }
 
 impl InfiniteFlatWorld {
     pub fn empty() -> Self {
         Self {
-            active_chunks: HashMap::new(),
+            arena: Arena::new(),
+            current: Vec::new(),
+            next: Vec::new(),
+            meta: Vec::new(),
+            index: FxHashMap::default(),
+            empty: Box::new(Chunk::empty()),
+            dying: Vec::new(),
+            still_dead: FxHashSet::default(),
+            newborn: FxHashMap::default(),
         }
     }
 
-    pub fn toggle(&mut self, x: i128, y: i128) {
-        self.active_chunks
-            .entry((x >> SHIFT_X, y >> SHIFT_Y))
-            .or_insert_with(Chunk::empty)
-            .toggle(x as usize & MASK_X, y as usize & MASK_Y);
+    pub fn insert_chunk(&mut self, coord: Coord, chunk: Chunk) {
+        let chunk = self.arena.own(chunk);
+        self.newborn.insert(coord, (chunk, [true; 2])); // be pessimistic about added chunks
+        self.create();
+    }
+
+    #[allow(unused)]
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        assert_eq!(self.current.len(), self.meta.len());
+        assert_eq!(self.next.len(), self.meta.len());
+        assert_eq!(self.index.len(), self.meta.len());
+
+        for (node_id, meta) in self.meta.iter().enumerate() {
+            assert_eq!(node_id, self.index[&meta.coord]);
+            for (dir, &neighbor) in meta.links.iter() {
+                assert_eq!(neighbor, self.index.get(&meta.coord.step(dir)).copied());
+                if let Some(neighbor) = neighbor {
+                    assert_eq!(Some(node_id), self.meta[neighbor].links[dir.opposite()]);
+                }
+            }
+        }
+
+        assert!(self.empty.is_empty());
+    }
+
+    fn create(&mut self) {
+        for (coord, (chunk_ref, edge_activity)) in self.newborn.drain() {
+            let node_id = self.current.len();
+
+            // first just insert it, insert any random junk into `next` to keep the length synced
+            self.current.push(chunk_ref);
+            self.next.push(self.arena.alloc());
+            self.index.insert(coord, node_id);
+
+            // then we need to sync up the neighbors table
+            let links = Links::from_fn(|dir| self.index.get(&coord.step(dir)).copied());
+            self.meta.push(Meta {
+                coord,
+                links,
+                edge_activity,
+            });
+            for (dir, &neighbor) in links.iter() {
+                if let Some(neighbor) = neighbor {
+                    self.meta[neighbor].links[dir.opposite()] = Some(node_id);
+                }
+            }
+        }
+    }
+
+    fn destroy(&mut self) {
+        for node_id in self.dying.drain(..).rev() {
+            // prepare for removal, patch up the links and coord-nodeid map
+            let meta = self.meta[node_id];
+            for (dir, &neighbor) in meta.links.iter() {
+                if let Some(neighbor) = neighbor {
+                    self.meta[neighbor].links[dir.opposite()] = None;
+                }
+            }
+            self.index.remove(&meta.coord);
+
+            // then we swap-remove it
+            self.arena.dealloc(self.current.swap_remove(node_id));
+            self.arena.dealloc(self.next.swap_remove(node_id));
+            self.meta.swap_remove(node_id);
+
+            // now we need to patch up the node that got replaced, only if it was not the last one
+            let Some(&meta) = self.meta.get(node_id) else {
+                continue;
+            };
+            for (dir, &neighbor) in meta.links.iter() {
+                if let Some(neighbor) = neighbor {
+                    self.meta[neighbor].links[dir.opposite()] = Some(node_id);
+                }
+            }
+            self.index.insert(meta.coord, node_id);
+        }
     }
 
     pub fn clock(&mut self) {
-        let empty = Chunk::empty();
+        let mut scratch_ref = self.arena.alloc();
+        let mut scratch = self.arena.get_mut(&mut scratch_ref);
 
-        macro_rules! get {
-            ($x:expr, $y:expr) => {
-                self.active_chunks.get(&($x, $y)).copied()
+        macro_rules! get_neighbors {
+            ($links: expr) => {
+                $links.map(|neighbor| {
+                    neighbor.map_or(&*self.empty, |node_id| {
+                        self.arena.get(&self.current[node_id])
+                    })
+                })
             };
         }
-        macro_rules! or_empty {
-            ($target:ident . $name:ident ($($chunk:expr),* $(,)?)) => {
-                $target.$name($(&$chunk.unwrap_or(empty)),*)
-            };
-            ($target:ident :: $name:ident ($($chunk:expr),* $(,)?)) => {
-                $target::$name($(&$chunk.unwrap_or(empty)),*)
-            }
-        }
 
-        let active_chunk_coords: Vec<_> = self.active_chunks.keys().copied().collect();
+        for (node_id, &meta) in self.meta.iter().enumerate() {
+            for (dir, &neighbor) in meta.links.iter() {
+                if neighbor.is_some() {
+                    continue;
+                }
 
-        for &(x, y) in &active_chunk_coords {
-            let top = get!(x, y + 1);
-            let top_right = get!(x + 1, y + 1);
-            let right = get!(x + 1, y);
-            let bottom_right = get!(x + 1, y - 1);
-            let bottom = get!(x, y - 1);
-            let bottom_left = get!(x - 1, y - 1);
-            let left = get!(x - 1, y);
-            let top_left = get!(x - 1, y + 1);
+                let coord = meta.coord.step(dir);
+                if self.still_dead.contains(&coord) || self.newborn.contains_key(&coord) {
+                    continue;
+                }
 
-            let chunk = self.active_chunks.get_mut(&(x, y)).unwrap();
+                let links = Links::from_fn(|other_dir| {
+                    let (dx, dy) = add(dir.offset(), other_dir.offset());
+                    match (dx, dy) {
+                        (0, 0) => Some(node_id),
+                        (-1..=1, -1..=1) => self.meta[node_id].links[Dir::from_offset(dx, dy)],
+                        _ => self.index.get(&coord.step(other_dir)).copied(),
+                    }
+                });
 
-            or_empty!(chunk.check(
-                top,
-                top_right,
-                right,
-                bottom_right,
-                bottom,
-                bottom_left,
-                left,
-                top_left,
-            ));
+                let neighbors = get_neighbors!(links);
 
-            let chunk = Some(*chunk);
+                if ![Dir::N, Dir::W, Dir::E, Dir::S]
+                    .into_iter()
+                    .filter_map(|dir| links[dir].map(|node_id| (dir, node_id)))
+                    .any(|(dir, node_id)| match dir {
+                        Dir::N => neighbors[Dir::N].is_bottom_active(),
+                        Dir::W => self.meta[node_id].edge_activity[1],
+                        Dir::E => self.meta[node_id].edge_activity[0],
+                        Dir::S => neighbors[Dir::S].is_top_active(),
+                        _ => unreachable!(),
+                    })
+                {
+                    // if no adjacent edges are active then we don't need to check anything
+                    self.still_dead.insert(coord);
+                    continue;
+                }
 
-            if top.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    get!(x, y + 2),
-                    get!(x + 1, y + 2),
-                    top_right,
-                    right,
-                    chunk,
-                    left,
-                    top_left,
-                    get!(x - 1, y + 2),
-                )) {
-                    self.active_chunks.insert((x, y + 1), new_chunk);
-                }
-            }
-            if top_right.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    get!(x + 1, y + 2),
-                    get!(x + 2, y + 2),
-                    get!(x + 2, y + 1),
-                    get!(x + 2, y),
-                    right,
-                    chunk,
-                    top,
-                    get!(x, y + 2),
-                )) {
-                    self.active_chunks.insert((x + 1, y + 1), new_chunk);
-                }
-            }
-            if right.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    top_right,
-                    get!(x + 2, y + 1),
-                    get!(x + 2, y),
-                    get!(x + 2, y - 1),
-                    bottom_right,
-                    bottom,
-                    chunk,
-                    top
-                )) {
-                    self.active_chunks.insert((x + 1, y), new_chunk);
-                }
-            }
-            if bottom_right.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    right,
-                    get!(x + 2, y),
-                    get!(x + 2, y - 1),
-                    get!(x + 2, y - 2),
-                    get!(x + 1, y - 2),
-                    get!(x, y - 2),
-                    bottom,
-                    chunk
-                )) {
-                    self.active_chunks.insert((x + 1, y - 1), new_chunk);
-                }
-            }
-            if bottom.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    chunk,
-                    right,
-                    bottom_right,
-                    get!(x + 1, y - 2),
-                    get!(x, y - 2),
-                    get!(x - 1, y - 2),
-                    bottom_left,
-                    left
-                )) {
-                    self.active_chunks.insert((x, y - 1), new_chunk);
-                }
-            }
-            if bottom_left.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    left,
-                    chunk,
-                    bottom,
-                    get!(x, y - 2),
-                    get!(x - 1, y - 2),
-                    get!(x - 2, y - 2),
-                    get!(x - 2, y - 1),
-                    get!(x - 2, y),
-                )) {
-                    self.active_chunks.insert((x - 1, y - 1), new_chunk);
-                }
-            }
-            if left.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    top_left,
-                    top,
-                    chunk,
-                    bottom,
-                    bottom_left,
-                    get!(x - 2, y - 1),
-                    get!(x - 2, y),
-                    get!(x - 2, y + 1)
-                )) {
-                    self.active_chunks.insert((x - 1, y), new_chunk);
-                }
-            }
-            if top_left.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    get!(x - 1, y + 2),
-                    get!(x, y + 2),
-                    top,
-                    chunk,
-                    left,
-                    get!(x - 2, y),
-                    get!(x - 2, y + 1),
-                    get!(x - 2, y + 2)
-                )) {
-                    self.active_chunks.insert((x - 1, y + 1), new_chunk);
+                let [left_edge_active, chunk_alive, right_edge_active] =
+                    Chunk::check_activity(neighbors, scratch);
+
+                if chunk_alive {
+                    self.newborn
+                        .insert(coord, (scratch_ref, [left_edge_active, right_edge_active]));
+
+                    scratch_ref = self.arena.alloc();
+                    scratch = self.arena.get_mut(&mut scratch_ref);
+                } else {
+                    self.still_dead.insert(coord);
                 }
             }
         }
 
-        self.active_chunks.retain(|_, chunk| chunk.will_be_active());
+        for (node_id, meta) in self.meta.iter_mut().enumerate() {
+            let nbhd = get_neighbors!(meta.links);
+            let dst = self.arena.get_mut(&mut self.next[node_id]);
 
-        for chunk in self.active_chunks.values_mut() {
-            chunk.update();
+            let [left_edge_active, chunk_alive, right_edge_active] = self
+                .arena
+                .get(&self.current[node_id])
+                .apply_rules(nbhd, dst);
+
+            if chunk_alive {
+                meta.edge_activity = [left_edge_active, right_edge_active];
+            } else {
+                self.dying.push(node_id);
+            }
         }
+
+        self.arena.dealloc(scratch_ref);
+        self.still_dead.clear();
+
+        mem::swap(&mut self.current, &mut self.next);
+
+        self.destroy();
+        self.create();
+    }
+}
+
+impl Index<Coord> for InfiniteFlatWorld {
+    type Output = Chunk;
+
+    fn index(&self, index: Coord) -> &Self::Output {
+        self.arena.get(&self.current[self.index[&index]])
     }
 }

@@ -2,7 +2,7 @@ use std::mem;
 
 use rand::Rng;
 
-use crate::chunk::{self, Chunk, Neighbourhood};
+use crate::chunk::{self, Chunk, NeighborData};
 
 #[derive(Clone)]
 pub struct ToroidalWorld {
@@ -42,7 +42,7 @@ impl ToroidalWorld {
     }
 
     pub fn num_alive(&self) -> usize {
-        self.chunks.iter().map(|chunk| chunk.num_alive()).sum()
+        self.chunks.iter().map(Chunk::num_alive).sum()
     }
 
     pub fn clock(&mut self) {
@@ -51,24 +51,20 @@ impl ToroidalWorld {
         let dst = self.alternate.as_mut();
 
         for i in 0..v {
-            let top = ((i + v - 1) % v) * h;
-            let current = i * h;
-            let bottom = ((i + 1) % v) * h;
+            // Row base offsets for dy = -1, 0, +1. Computed once per row.
+            let rows = [((i + v - 1) % v) * h, i * h, ((i + 1) % v) * h];
 
             for j in 0..h {
-                let l = (j + h - 1) % h;
-                let r = (j + 1) % h;
-                let nbhd = Neighbourhood {
-                    nw: &src[top + l],
-                    n: &src[top + j],
-                    ne: &src[top + r],
-                    w: &src[current + l],
-                    e: &src[current + r],
-                    sw: &src[bottom + l],
-                    s: &src[bottom + j],
-                    se: &src[bottom + r],
-                };
-                src[current + j].apply_rules(nbhd, &mut dst[current + j]);
+                // Wrapped columns for dx = -1, 0, +1. Computed once per chunk.
+                let cols = [(j + h - 1) % h, j, (j + 1) % h];
+
+                let nbhd = NeighborData::from_fn(|d| {
+                    let (dx, dy) = d.offset();
+                    &src[rows[(dy + 1) as usize] + cols[(dx + 1) as usize]]
+                });
+
+                let cur = rows[1] + j;
+                src[cur].apply_rules(nbhd, &mut dst[cur]);
             }
         }
 

@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use game_of_life::chunk::{self, Chunk, NeighborData};
 use rand::{SeedableRng, rngs::StdRng};
 
-use game_of_life::toroidalworld::ToroidalWorld;
+use game_of_life::toroidal_world::ToroidalWorld;
 
 /// Generations per Criterion iteration. Set with `GOL_GENS=...`.
 fn gens_per_iter() -> u64 {
@@ -55,9 +56,33 @@ fn clock(c: &mut Criterion) {
     group.finish();
 }
 
+fn single_chunk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("apply_rules_single_chunk");
+    group.throughput(Throughput::Elements((chunk::SIZE * chunk::SIZE) as u64));
+
+    let mut dst = Chunk::empty();
+    let live = Chunk::random(&mut StdRng::seed_from_u64(1));
+    let zero = Chunk::empty();
+
+    group.bench_function("known_empty", |b| {
+        let nbhd = NeighborData::from_fn(|_| black_box(&live));
+        b.iter(|| black_box(Chunk::check_activity(nbhd, black_box(&mut dst))))
+    });
+
+    // Opaque baselines: same data, but the compiler cannot see it.
+    group.bench_function("opaque_empty", |b| {
+        b.iter(|| {
+            let nbhd = NeighborData::from_fn(|_| black_box(&zero));
+            black_box(black_box(&live).apply_rules(nbhd, black_box(&mut dst)))
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(20);
-    targets = clock
+    targets = clock, single_chunk
 }
 criterion_main!(benches);

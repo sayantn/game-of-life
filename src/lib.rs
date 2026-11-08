@@ -11,9 +11,9 @@
     feature(stdarch_loongarch)
 )]
 
-pub mod cell;
+mod arena;
 pub mod chunk;
 pub mod infinite_flat_world;
-pub mod oldchunk;
+mod parse;
 mod row;
-pub mod toroidalworld;
+pub mod toroidal_world;

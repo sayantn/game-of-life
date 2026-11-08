@@ -1,5 +1,4 @@
-use std::simd::num::SimdUint;
-use std::{mem, simd::*};
+use std::mem;
 
 pub(crate) type Row = cfg_select! {
     all(
@@ -90,6 +89,10 @@ pub(crate) type Row = cfg_select! {
 };
 
 pub(crate) const ROW_BYTES: usize = mem::size_of::<Row>();
+pub(crate) const ROW_BITS: usize = ROW_BYTES * 8;
+
+#[allow(unused)]
+pub(crate) const LANE_BITS: usize = ROW_BITS / NUM_LANES;
 
 cfg_select! {
     any(
@@ -125,6 +128,10 @@ cfg_select! {
             target_feature = "lsx"
         )
     ) => {
+        use std::simd::{num::SimdUint, *};
+
+        const NUM_LANES: usize = Row::LEN;
+
         #[inline]
         pub(crate) fn empty_row() -> Row {
             Simd::splat(0)
@@ -143,6 +150,16 @@ cfg_select! {
         #[inline]
         pub(crate) fn row_num_alive(row: Row) -> usize {
             row.count_ones().reduce_sum() as _
+        }
+
+        #[inline]
+        pub(crate) fn leftmost_col(row: Row) -> bool {
+            row[0] & (1 << (LANE_BITS - 1)) != 0
+        }
+
+        #[inline]
+        pub(crate) fn rightmost_col(row: Row) -> bool {
+            row[NUM_LANES - 1] & 1 != 0
         }
 
         cfg_select! {
@@ -217,6 +234,8 @@ cfg_select! {
         }
     }
     _ => {
+        const NUM_LANES: usize = 1;
+
         #[inline]
         pub(crate) fn empty_row() -> Row {
             0
@@ -238,12 +257,22 @@ cfg_select! {
         }
 
         #[inline]
-        pub(crate) fn shld1(a: Row, b: Row) -> Row {
+        pub(crate) fn leftmost_col(row: Row) -> bool {
+            row & (1 << (LANE_BITS - 1)) != 0
+        }
+
+        #[inline]
+        pub(crate) fn rightmost_col(row: Row) -> bool {
+            row & 1 != 0
+        }
+
+        #[inline]
+        fn shld1(a: Row, b: Row) -> Row {
             a.funnel_shl(b, 1)
         }
 
         #[inline]
-        pub(crate) fn shrd1(a: Row, b: Row) -> Row {
+        fn shrd1(a: Row, b: Row) -> Row {
             a.funnel_shr(b, 1)
         }
     }
@@ -290,6 +319,85 @@ impl RowDigest {
             row,
             doublet,
             triplet,
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use std::array;
+
+    use super::*;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    type Bits = [bool; ROW_BITS];
+
+    fn bit_iter(a: &u8) -> impl Iterator<Item = bool> {
+        (0..8).map(move |i| a & (0x80 >> i) != 0)
+    }
+
+    /// Column 0 is the MSB of byte 0, matching `row_to_bytes` and the parser.
+    fn to_bools(row: Row) -> Bits {
+        let bytes = row_to_bytes(row);
+        let mut out = [false; ROW_BITS];
+        for (dst, bit) in out.iter_mut().zip(bytes.iter().flat_map(bit_iter)) {
+            *dst = bit;
+        }
+        out
+    }
+
+    fn from_bools(bits: &Bits) -> Row {
+        let mut bytes = [0u8; ROW_BYTES];
+        for (j, &b) in bits.iter().enumerate() {
+            if b {
+                bytes[j / 8] |= 0x80 >> (j % 8);
+            }
+        }
+        row_from_bytes(bytes)
+    }
+
+    /// Every lane boundary and its neighbours, as single-bit rows.
+    fn edge_rows() -> impl Iterator<Item = Row> {
+        [0, 1, ROW_BITS - 2, ROW_BITS - 1]
+            .into_iter()
+            .chain((1..NUM_LANES).flat_map(|lane| [lane * LANE_BITS - 1, lane * LANE_BITS]))
+            .map(|j| {
+                let mut bits = [false; ROW_BITS];
+                bits[j] = true;
+                from_bools(&bits)
+            })
+            .chain([empty_row(), !empty_row()])
+    }
+
+    /// Edge cases followed by `n` seeded random rows.
+    fn cases(n: usize, seed: u64) -> impl Iterator<Item = Row> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        edge_rows().chain((0..n).map(move |_| row_from_bytes(rng.random())))
+    }
+
+    fn ref_shld1(a: &Bits, b: &Bits) -> Bits {
+        array::from_fn(|j| if j + 1 < ROW_BITS { a[j + 1] } else { b[0] })
+    }
+
+    fn ref_shrd1(a: &Bits, b: &Bits) -> Bits {
+        array::from_fn(|j| if j > 0 { b[j - 1] } else { a[ROW_BITS - 1] })
+    }
+
+    #[test]
+    fn shld1_matches_reference() {
+        for a in cases(64, 1) {
+            for b in cases(64, 2) {
+                assert_eq!(to_bools(shld1(a, b)), ref_shld1(&to_bools(a), &to_bools(b)));
+            }
+        }
+    }
+
+    #[test]
+    fn shrd1_matches_reference() {
+        for a in cases(64, 3) {
+            for b in cases(64, 4) {
+                assert_eq!(to_bools(shrd1(a, b)), ref_shrd1(&to_bools(a), &to_bools(b)));
+            }
         }
     }
 }
