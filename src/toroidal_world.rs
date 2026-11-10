@@ -1,6 +1,7 @@
 use std::mem;
 
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::chunk::{self, Chunk, NeighborData};
 
@@ -50,22 +51,26 @@ impl ToroidalWorld {
         let src = self.chunks.as_ref();
         let dst = self.alternate.as_mut();
 
-        for i in 0..v {
-            // Row base offsets for dy = -1, 0, +1. Computed once per row.
+        let process = |(idx, dst_chunk): (usize, &mut Chunk)| {
+            // Reconstruct 2D coordinates from the 1D index
+            let i = idx / h;
+            let j = idx % h;
+
             let rows = [((i + v - 1) % v) * h, i * h, ((i + 1) % v) * h];
+            let cols = [(j + h - 1) % h, j, (j + 1) % h];
 
-            for j in 0..h {
-                // Wrapped columns for dx = -1, 0, +1. Computed once per chunk.
-                let cols = [(j + h - 1) % h, j, (j + 1) % h];
+            let nbhd = NeighborData::from_fn(|d| {
+                let (dx, dy) = d.offset();
+                &src[rows[(dy + 1) as usize] + cols[(dx + 1) as usize]]
+            });
 
-                let nbhd = NeighborData::from_fn(|d| {
-                    let (dx, dy) = d.offset();
-                    &src[rows[(dy + 1) as usize] + cols[(dx + 1) as usize]]
-                });
+            src[idx].apply_rules(nbhd, dst_chunk);
+        };
 
-                let cur = rows[1] + j;
-                src[cur].apply_rules(nbhd, &mut dst[cur]);
-            }
+        if src.len() <= 16 {
+            dst.iter_mut().enumerate().for_each(process);
+        } else {
+            dst.par_iter_mut().enumerate().for_each(process);
         }
 
         mem::swap(&mut self.chunks, &mut self.alternate);

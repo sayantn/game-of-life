@@ -1,5 +1,3 @@
-use std::mem;
-
 pub(crate) type Row = cfg_select! {
     all(
         any(target_arch = "x86", target_arch = "x86_64"),
@@ -88,11 +86,11 @@ pub(crate) type Row = cfg_select! {
     _ => u64,
 };
 
-pub(crate) const ROW_BYTES: usize = mem::size_of::<Row>();
-pub(crate) const ROW_BITS: usize = ROW_BYTES * 8;
+pub(crate) const ROW_BYTES: usize = ROW_BITS / 8;
+pub(crate) const ROW_BITS: usize = LANE_BITS * NUM_LANES;
 
 #[allow(unused)]
-pub(crate) const LANE_BITS: usize = ROW_BITS / NUM_LANES;
+pub(crate) const LANE_BITS: usize = Lane::BITS as usize;
 
 cfg_select! {
     any(
@@ -130,7 +128,7 @@ cfg_select! {
     ) => {
         use std::simd::{num::SimdUint, *};
 
-        const NUM_LANES: usize = Row::LEN;
+        pub(crate) const NUM_LANES: usize = Row::LEN;
 
         #[inline]
         pub(crate) fn empty_row() -> Row {
@@ -153,14 +151,27 @@ cfg_select! {
         }
 
         #[inline]
-        pub(crate) fn leftmost_col(row: Row) -> bool {
-            row[0] & (1 << (LANE_BITS - 1)) != 0
+        pub(crate) fn edge_cols(row: Row) -> Lane {
+            (row[0] & (1 << (LANE_BITS - 1))) | (row[NUM_LANES - 1] & 1)
         }
 
-        #[inline]
-        pub(crate) fn rightmost_col(row: Row) -> bool {
-            row[NUM_LANES - 1] & 1 != 0
-        }
+        pub(crate) type Lane = cfg_select! {
+            any(
+                target_arch = "arm",
+                all(
+                    any(target_arch = "powerpc", target_arch = "powerpc64"),
+                    target_endian = "big",
+                    target_feature = "vsx"
+                ),
+                all(
+                    any(target_arch = "riscv64", target_arch = "riscv32"),
+                    not(target_feature = "zve64x")
+                ),
+                target_arch = "hexagon",
+                target_arch = "csky"
+            ) => u32,
+            _ => u64,
+        };
 
         cfg_select! {
             all(target_arch = "s390x", target_feature = "vector-enhancements-2") => {
@@ -234,7 +245,9 @@ cfg_select! {
         }
     }
     _ => {
-        const NUM_LANES: usize = 1;
+        pub(crate) const NUM_LANES: usize = 1;
+
+        pub(crate) type Lane = u64;
 
         #[inline]
         pub(crate) fn empty_row() -> Row {
@@ -257,13 +270,8 @@ cfg_select! {
         }
 
         #[inline]
-        pub(crate) fn leftmost_col(row: Row) -> bool {
-            row & (1 << (LANE_BITS - 1)) != 0
-        }
-
-        #[inline]
-        pub(crate) fn rightmost_col(row: Row) -> bool {
-            row & 1 != 0
+        pub(crate) fn edge_cols(row: Row) -> Lane {
+            (row & (1 << (LANE_BITS - 1))) | (row & 1)
         }
 
         #[inline]

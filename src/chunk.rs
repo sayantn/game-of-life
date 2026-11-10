@@ -46,7 +46,7 @@ impl Chunk {
         true
     }
 
-    pub fn apply_rules(&self, nbhd: NeighborData<&Chunk>, dst: &mut Self) -> [bool; 3] {
+    pub fn apply_rules(&self, nbhd: NeighborData<&Chunk>, dst: &mut Self) -> Activity {
         let left = &nbhd[Dir::W].data;
         let right = &nbhd[Dir::E].data;
 
@@ -56,6 +56,7 @@ impl Chunk {
             nbhd[Dir::NE].data[SIZE - 1],
         );
         let mut current_row = RowDigest::new(self.data[0], left[0], right[0]);
+
         let mut acc = empty_row();
 
         for i in 0..SIZE - 1 {
@@ -67,7 +68,9 @@ impl Chunk {
                 current_row.row,
             );
             dst.data[i] = result;
+
             acc |= result;
+
             top_row = current_row;
             current_row = bottom_row;
         }
@@ -84,20 +87,13 @@ impl Chunk {
             current_row.row,
         );
         dst.data[SIZE - 1] = result;
+
         acc |= result;
 
-        [leftmost_col(acc), acc != empty_row(), rightmost_col(acc)]
+        compute_activity(acc, dst.data[0], result)
     }
 
-    pub(crate) fn is_top_active(&self) -> bool {
-        self.data[0] != empty_row()
-    }
-
-    pub(crate) fn is_bottom_active(&self) -> bool {
-        self.data[SIZE - 1] != empty_row()
-    }
-
-    pub fn check_activity(nbhd: NeighborData<&Chunk>, dst: &mut Self) -> [bool; 3] {
+    pub fn check_activity(nbhd: NeighborData<&Chunk>, dst: &mut Self) -> Activity {
         let left = &nbhd[Dir::W].data;
         let right = &nbhd[Dir::E].data;
 
@@ -137,7 +133,7 @@ impl Chunk {
         dst.data[SIZE - 1] = result;
         acc |= result;
 
-        [leftmost_col(acc), acc != empty_row(), rightmost_col(acc)]
+        compute_activity(acc, dst.data[0], result)
     }
 }
 
@@ -153,6 +149,53 @@ impl Debug for Chunk {
             f.write_str(str::from_utf8(&line).unwrap())?;
         }
         Ok(())
+    }
+}
+
+fn compute_activity(acc: Row, top_row: Row, bottom_row: Row) -> Activity {
+    Activity {
+        is_active: acc != empty_row(),
+        is_top_active: top_row != empty_row(),
+        is_bottom_active: bottom_row != empty_row(),
+        left_right_activity: edge_cols(acc),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Activity {
+    left_right_activity: Lane,
+    is_active: bool,
+    is_top_active: bool,
+    is_bottom_active: bool,
+}
+
+impl Activity {
+    pub const ALL: Activity = Activity {
+        left_right_activity: !0,
+        is_active: true,
+        is_top_active: true,
+        is_bottom_active: true,
+    };
+
+    pub const EMPTY: Activity = Activity {
+        left_right_activity: 0,
+        is_active: false,
+        is_top_active: false,
+        is_bottom_active: false,
+    };
+
+    pub fn is_active(self) -> bool {
+        self.is_active
+    }
+
+    pub fn is_edge_active(self, dir: Dir) -> bool {
+        match dir {
+            Dir::N => self.is_top_active,
+            Dir::W => self.left_right_activity >> 1 != 0,
+            Dir::E => self.left_right_activity << 1 != 0,
+            Dir::S => self.is_bottom_active,
+            _ => panic!("Not orthogonal direction: {dir:?}"),
+        }
     }
 }
 
