@@ -4,7 +4,7 @@ use std::mem;
 use fxhash::{FxHashMap, FxHashSet};
 
 use crate::arena::{Arena, Batch, ChunkRef};
-use crate::chunk::{Activity, Chunk, Dir, NeighborData};
+use crate::chunk::{Activity, Chunk, Dir, NeighborData, Orth};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Coord {
@@ -33,10 +33,8 @@ struct Node {
 
 struct RawInfiniteFlatWorld {
     arena: Arena,
-
     nodes: Vec<Node>,
     index: FxHashMap<Coord, usize>,
-
     empty: ChunkRef,
 }
 
@@ -59,6 +57,8 @@ impl RawInfiniteFlatWorld {
                 }
             }
         }
+
+        assert!(self.arena.load(self.empty.read()).is_empty());
     }
 
     fn create(&mut self, coord: Coord, chunk: ChunkRef, activity: Activity) {
@@ -104,44 +104,44 @@ impl RawInfiniteFlatWorld {
         self.index.insert(coord, node_id);
     }
 
-    fn clock(
-        &mut self,
-        checked: &mut FxHashSet<Coord>,
-        coords_buf: &mut Vec<Coord>,
-        static_batch: &mut Batch<'static>,
-        alive_dsts: &mut Vec<ChunkRef>,
-        dead_dsts: &mut Vec<ChunkRef>,
-        results_buf: &mut Vec<Activity>,
-    ) -> (usize, usize) {
+    fn clock(&mut self, scratch: &mut Scratch) -> (usize, usize) {
         macro_rules! get_neighbors {
             ($links: expr) => {
                 $links.map(|neighbor| {
                     neighbor
-                        .map_or(&self.empty, |node_id| &self.nodes[node_id].chunk)
+                        .map_or(&self.empty, |node_id| unsafe {
+                            &self.nodes.get_unchecked(node_id).chunk
+                        })
                         .read()
                 })
             };
         }
 
-        let mut batch = mem::take(static_batch).reinterpret();
+        let mut batch = mem::take(&mut scratch.batch).reinterpret();
 
-        checked.clear();
+        scratch.checked.clear();
+
+        let node_count = self.nodes.len();
+        batch.reserve_alive(node_count);
+        scratch.alive_dsts.reserve(node_count);
 
         for (node_id, node) in self.nodes.iter().enumerate() {
-            batch.push_alive(node.chunk.read(), get_neighbors!(node.links));
-            alive_dsts.push(self.arena.alloc());
+            batch.push_alive_within_capacity(node.chunk.read(), get_neighbors!(node.links));
+            let _ = scratch.alive_dsts.push_within_capacity(self.arena.alloc());
 
-            for dir in [Dir::N, Dir::W, Dir::E, Dir::S] {
-                if !node.activity.edge(dir) {
+            for orth in [Orth::N, Orth::W, Orth::E, Orth::S] {
+                if !node.activity.edge(orth) {
                     continue;
                 }
+
+                let dir = orth.dir();
 
                 if node.links[dir].is_some() {
                     continue;
                 }
 
                 let coord = node.coord.step(dir);
-                if !checked.insert(coord) {
+                if !scratch.checked.insert(coord) {
                     continue;
                 }
 
@@ -149,31 +149,38 @@ impl RawInfiniteFlatWorld {
                     let (dx, dy) = add(dir.offset(), other_dir.offset());
                     match (dx, dy) {
                         (0, 0) => Some(node_id),
-                        (-1..=1, -1..=1) => self.nodes[node_id].links[Dir::from_offset(dx, dy)],
+                        (-1..=1, -1..=1) => node.links[Dir::from_offset(dx, dy)],
                         _ => self.index.get(&coord.step(other_dir)).copied(),
                     }
                 });
 
-                coords_buf.push(coord);
+                scratch.coords_buf.push(coord);
                 batch.push_dead(get_neighbors!(links));
-                dead_dsts.push(self.arena.alloc());
+                scratch.dead_dsts.push(self.arena.alloc());
             }
         }
 
-        self.arena
-            .compute_batched(&batch, alive_dsts, dead_dsts, results_buf);
+        self.arena.compute_batched(
+            &batch,
+            &mut scratch.alive_dsts,
+            &mut scratch.dead_dsts,
+            &mut scratch.results_buf,
+        );
 
-        let (alive_chunks_checked, dead_chunks_checked) = (alive_dsts.len(), dead_dsts.len());
+        let (alive_chunks_checked, dead_chunks_checked) =
+            (scratch.alive_dsts.len(), scratch.dead_dsts.len());
 
-        *static_batch = batch.reinterpret();
+        scratch.batch = batch.reinterpret();
 
-        for (node_id, (chunk, activity)) in
-            zip(alive_dsts.drain(..), results_buf.drain(..self.nodes.len()))
-                .enumerate()
-                .rev()
+        for (node_id, (chunk, activity)) in zip(
+            scratch.alive_dsts.drain(..),
+            scratch.results_buf.drain(..self.nodes.len()),
+        )
+        .enumerate()
+        .rev()
         {
             if activity.chunk() {
-                let node = &mut self.nodes[node_id];
+                let node = unsafe { self.nodes.get_unchecked_mut(node_id) };
                 self.arena.dealloc(mem::replace(&mut node.chunk, chunk));
                 node.activity = activity;
             } else {
@@ -183,8 +190,8 @@ impl RawInfiniteFlatWorld {
         }
 
         for (coord, (chunk, activity)) in zip(
-            coords_buf.drain(..),
-            zip(dead_dsts.drain(..), results_buf.drain(..)),
+            scratch.coords_buf.drain(..),
+            zip(scratch.dead_dsts.drain(..), scratch.results_buf.drain(..)),
         ) {
             if activity.chunk() {
                 self.create(coord, chunk, activity);
@@ -193,18 +200,26 @@ impl RawInfiniteFlatWorld {
             }
         }
 
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+
         (alive_chunks_checked, dead_chunks_checked)
     }
 }
 
-pub struct InfiniteFlatWorld {
-    raw: RawInfiniteFlatWorld,
+#[derive(Default)]
+struct Scratch {
     checked: FxHashSet<Coord>,
     coords_buf: Vec<Coord>,
     batch: Batch<'static>,
     alive_dsts: Vec<ChunkRef>,
     dead_dsts: Vec<ChunkRef>,
     results_buf: Vec<Activity>,
+}
+
+pub struct InfiniteFlatWorld {
+    raw: RawInfiniteFlatWorld,
+    scratch: Scratch,
 }
 
 impl InfiniteFlatWorld {
@@ -217,25 +232,18 @@ impl InfiniteFlatWorld {
                 nodes: Vec::new(),
                 index: FxHashMap::default(),
             },
-            checked: FxHashSet::default(),
-            coords_buf: Vec::new(),
-            batch: Batch::new(),
-            alive_dsts: Vec::new(),
-            dead_dsts: Vec::new(),
-            results_buf: Vec::new(),
+            scratch: Scratch::default(),
         }
     }
 
     pub fn insert_chunk(&mut self, coord: Coord, chunk: Chunk) {
-        let chunk = self.raw.arena.own(chunk);
-
-        match self.raw.index.get(&coord) {
-            Some(&node_id) => {
-                let node = &mut self.raw.nodes[node_id];
-                node.chunk = chunk;
-                node.activity = Activity::ALL;
-            }
-            None => self.raw.create(coord, chunk, Activity::ALL),
+        if let Some(&node_id) = self.raw.index.get(&coord) {
+            let node = &mut self.raw.nodes[node_id];
+            self.raw.arena.store(&mut node.chunk, chunk);
+            node.activity = Activity::ALL;
+        } else {
+            let chunk = self.raw.arena.own(chunk);
+            self.raw.create(coord, chunk, Activity::ALL);
         }
     }
 
@@ -260,14 +268,7 @@ impl InfiniteFlatWorld {
     }
 
     pub fn clock(&mut self) -> (usize, usize) {
-        self.raw.clock(
-            &mut self.checked,
-            &mut self.coords_buf,
-            &mut self.batch,
-            &mut self.alive_dsts,
-            &mut self.dead_dsts,
-            &mut self.results_buf,
-        )
+        self.raw.clock(&mut self.scratch)
     }
 }
 
@@ -299,12 +300,7 @@ impl Clone for InfiniteFlatWorld {
                 nodes: new_nodes,
                 index: self.raw.index.clone(),
             },
-            checked: self.checked.clone(),
-            coords_buf: Vec::new(),
-            batch: Batch::new(),
-            alive_dsts: Vec::new(),
-            dead_dsts: Vec::new(),
-            results_buf: Vec::new(),
+            scratch: Scratch::default(),
         }
     }
 }

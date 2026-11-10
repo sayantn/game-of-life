@@ -13,6 +13,7 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    #[allow(clippy::large_types_passed_by_value)]
     fn new(data: [Row; SIZE]) -> Self {
         Self { data }
     }
@@ -38,8 +39,9 @@ impl Chunk {
     }
 
     pub fn is_empty(&self) -> bool {
-        for block in self.data.chunks_exact(16) {
-            if block.iter().copied().reduce(Row::bitor).unwrap() != empty_row() {
+        for block in self.data.as_chunks::<16>().0 {
+            let acc = unsafe { block.iter().copied().reduce(Row::bitor).unwrap_unchecked() };
+            if acc != empty_row() {
                 return false;
             }
         }
@@ -188,13 +190,34 @@ impl Activity {
         self.chunk
     }
 
-    pub fn edge(self, dir: Dir) -> bool {
-        match dir {
-            Dir::N => self.top,
-            Dir::W => self.left_right >> 1 != 0,
-            Dir::E => self.left_right << 1 != 0,
-            Dir::S => self.bottom,
-            _ => panic!("Not orthogonal direction: {dir:?}"),
+    pub fn edge(self, orth: Orth) -> bool {
+        match orth {
+            Orth::N => self.top,
+            Orth::W => self.left_right >> 1 != 0,
+            Orth::E => self.left_right << 1 != 0,
+            Orth::S => self.bottom,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orth {
+    N,
+    W,
+    E,
+    S,
+}
+
+impl Orth {
+    pub const ALL: [Orth; 4] = [Orth::N, Orth::W, Orth::E, Orth::S];
+
+    pub fn dir(self) -> Dir {
+        match self {
+            Self::N => Dir::N,
+            Self::W => Dir::W,
+            Self::E => Dir::E,
+            Self::S => Dir::S,
         }
     }
 }

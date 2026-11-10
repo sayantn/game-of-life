@@ -1,8 +1,6 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 
-use rayon::prelude::*;
-
 use crate::chunk::{Activity, Chunk, NeighborData};
 
 pub(crate) struct ChunkRef(usize);
@@ -40,16 +38,17 @@ impl Arena {
         self.own(Chunk::empty())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn dealloc(&mut self, idx: ChunkRef) {
         self.free.push(idx.0);
     }
 
     fn get<'a>(&'a self, idx: Id<'a>) -> &'a Chunk {
-        unsafe { self.chunks[idx.0].as_ref_unchecked() }
+        unsafe { self.chunks.get_unchecked(idx.0).as_ref_unchecked() }
     }
 
     fn get_mut<'a>(&'a self, idx: &'a mut ChunkRef) -> &'a mut Chunk {
-        unsafe { self.chunks[idx.0].as_mut_unchecked() }
+        unsafe { self.chunks.get_unchecked(idx.0).as_mut_unchecked() }
     }
 
     pub(crate) fn load<'a>(&'a self, idx: Id<'a>) -> Chunk {
@@ -87,7 +86,36 @@ impl Arena {
     ) {
         let total_len = alive_dsts.len() + dead_dsts.len();
 
-        if total_len < 128 {
+        if cfg!(feature = "rayon") && total_len >= 128 {
+            #[cfg(feature = "rayon")]
+            {
+                use rayon::prelude::*;
+
+                let alive_results = batch
+                    .alive_srcs
+                    .par_iter()
+                    .zip(&batch.alive_nbhds)
+                    .zip(alive_dsts)
+                    .map(|((&src, &neighbors), dst)| {
+                        self.get(src)
+                            .apply_rules(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
+                    });
+
+                let dead_results =
+                    batch
+                        .dead_nbhds
+                        .par_iter()
+                        .zip(dead_dsts)
+                        .map(|(&neighbors, dst)| {
+                            Chunk::check_activity(
+                                neighbors.map(|idx| self.get(idx)),
+                                self.get_mut(dst),
+                            )
+                        });
+
+                alive_results.chain(dead_results).collect_into_vec(results);
+            }
+        } else {
             results.extend(
                 batch
                     .alive_srcs
@@ -109,27 +137,6 @@ impl Arena {
                         Chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
                     }),
             );
-        } else {
-            let alive_results = batch
-                .alive_srcs
-                .par_iter()
-                .zip(&batch.alive_nbhds)
-                .zip(alive_dsts)
-                .map(|((&src, &neighbors), dst)| {
-                    self.get(src)
-                        .apply_rules(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
-                });
-
-            let dead_results =
-                batch
-                    .dead_nbhds
-                    .par_iter()
-                    .zip(dead_dsts)
-                    .map(|(&neighbors, dst)| {
-                        Chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
-                    });
-
-            alive_results.chain(dead_results).collect_into_vec(results);
         }
     }
 }
@@ -145,17 +152,14 @@ pub(crate) struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn new() -> Self {
-        Self {
-            alive_srcs: Vec::new(),
-            alive_nbhds: Vec::new(),
-            dead_nbhds: Vec::new(),
-        }
+    pub(crate) fn reserve_alive(&mut self, additional: usize) {
+        self.alive_srcs.reserve(additional);
+        self.alive_nbhds.reserve(additional);
     }
 
-    pub(crate) fn push_alive(&mut self, src: Id<'a>, nbhd: NeighborData<Id<'a>>) {
-        self.alive_srcs.push(src);
-        self.alive_nbhds.push(nbhd);
+    pub(crate) fn push_alive_within_capacity(&mut self, src: Id<'a>, nbhd: NeighborData<Id<'a>>) {
+        let _ = self.alive_srcs.push_within_capacity(src);
+        let _ = self.alive_nbhds.push_within_capacity(nbhd);
     }
 
     pub(crate) fn push_dead(&mut self, nbhd: NeighborData<Id<'a>>) {

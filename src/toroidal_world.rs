@@ -1,7 +1,6 @@
 use std::mem;
 
 use rand::Rng;
-use rayon::prelude::*;
 
 use crate::chunk::{self, Chunk, NeighborData};
 
@@ -9,8 +8,9 @@ use crate::chunk::{self, Chunk, NeighborData};
 pub struct ToroidalWorld {
     chunks: Box<[Chunk]>,
     alternate: Box<[Chunk]>,
-    v_chunks: usize,
-    h_chunks: usize,
+    topology: Box<[NeighborData<usize>]>,
+    // v_chunks: usize,
+    // h_chunks: usize,
 }
 
 impl ToroidalWorld {
@@ -19,14 +19,32 @@ impl ToroidalWorld {
         v_chunks: usize,
         mut f: impl FnMut(usize, usize) -> Chunk,
     ) -> Self {
+        let topology = (0..v_chunks)
+            .flat_map(|i| (0..h_chunks).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                let rows = [
+                    ((i + v_chunks - 1) % v_chunks) * h_chunks,
+                    i * h_chunks,
+                    ((i + 1) % v_chunks) * h_chunks,
+                ];
+                let cols = [(j + h_chunks - 1) % h_chunks, j, (j + 1) % h_chunks];
+
+                NeighborData::from_fn(|dir| {
+                    let (dx, dy) = dir.offset();
+                    rows[(dy + 1) as usize] + cols[(dx + 1) as usize]
+                })
+            })
+            .collect();
+
         Self {
             chunks: (0..v_chunks)
                 .flat_map(|i| (0..h_chunks).map(move |j| (i, j)))
                 .map(|(i, j)| f(i, j))
                 .collect(),
             alternate: (0..v_chunks * h_chunks).map(|_| Chunk::empty()).collect(),
-            v_chunks,
-            h_chunks,
+            topology,
+            // v_chunks,
+            // h_chunks,
         }
     }
 
@@ -47,30 +65,25 @@ impl ToroidalWorld {
     }
 
     pub fn clock(&mut self) {
-        let (v, h) = (self.v_chunks, self.h_chunks);
         let src = self.chunks.as_ref();
         let dst = self.alternate.as_mut();
+        let topo = self.topology.as_ref();
 
-        let process = |(idx, dst_chunk): (usize, &mut Chunk)| {
-            // Reconstruct 2D coordinates from the 1D index
-            let i = idx / h;
-            let j = idx % h;
+        let process =
+            |((src_chunk, dst_chunk), links): ((&Chunk, &mut Chunk), &NeighborData<usize>)| {
+                let nbhd = links.map(|idx| unsafe { src.get_unchecked(idx) });
+                src_chunk.apply_rules(nbhd, dst_chunk);
+            };
 
-            let rows = [((i + v - 1) % v) * h, i * h, ((i + 1) % v) * h];
-            let cols = [(j + h - 1) % h, j, (j + 1) % h];
+        if cfg!(feature = "rayon") && self.chunks.len() >= 16 {
+            #[cfg(feature = "rayon")]
+            {
+                use rayon::prelude::*;
 
-            let nbhd = NeighborData::from_fn(|d| {
-                let (dx, dy) = d.offset();
-                &src[rows[(dy + 1) as usize] + cols[(dx + 1) as usize]]
-            });
-
-            src[idx].apply_rules(nbhd, dst_chunk);
-        };
-
-        if src.len() <= 16 {
-            dst.iter_mut().enumerate().for_each(process);
+                src.par_iter().zip(dst).zip(topo).for_each(process);
+            }
         } else {
-            dst.par_iter_mut().enumerate().for_each(process);
+            src.iter().zip(dst).zip(topo).for_each(process);
         }
 
         mem::swap(&mut self.chunks, &mut self.alternate);

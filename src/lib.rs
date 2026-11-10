@@ -1,4 +1,4 @@
-#![feature(portable_simd)]
+#![feature(portable_simd, vec_push_within_capacity)]
 #![cfg_attr(
     all(target_arch = "s390x", target_feature = "vector-enhancements-2"),
     feature(stdarch_s390x)
@@ -9,6 +9,13 @@
         target_feature = "lasx"
     ),
     feature(stdarch_loongarch)
+)]
+#![allow(
+    clippy::must_use_candidate,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::wildcard_imports,
+    clippy::return_self_not_must_use
 )]
 
 mod arena;
