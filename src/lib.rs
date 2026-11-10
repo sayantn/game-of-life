@@ -13,7 +13,11 @@
 
 mod arena;
 pub mod chunk;
-pub mod infinite_flat_world;
+// pub mod infinite_flat_world;
+pub mod infinite_flat_world_2;
 mod parse;
 mod row;
 pub mod toroidal_world;
+
+#[cfg(test)]
+mod naive;
