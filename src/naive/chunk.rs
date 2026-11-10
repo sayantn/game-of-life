@@ -5,16 +5,16 @@ use std::ops::Index;
 
 use rand::Rng;
 
-use crate::cell::Cell::{self, *};
+use super::cell::Cell::{self, *};
 
-pub(crate) const SHIFT_X: usize = 4;
-pub(crate) const SHIFT_Y: usize = 4;
+pub(super) const SHIFT_X: usize = 4;
+pub(super) const SHIFT_Y: usize = 4;
 
-pub(crate) const SIZE_X: usize = 1 << SHIFT_X;
-pub(crate) const SIZE_Y: usize = 1 << SHIFT_Y;
+pub(super) const SIZE_X: usize = 1 << SHIFT_X;
+pub(super) const SIZE_Y: usize = 1 << SHIFT_Y;
 
-pub(crate) const MASK_X: usize = SIZE_X - 1;
-pub(crate) const MASK_Y: usize = SIZE_Y - 1;
+pub(super) const MASK_X: usize = SIZE_X - 1;
+pub(super) const MASK_Y: usize = SIZE_Y - 1;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Chunk {

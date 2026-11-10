@@ -1,7 +1,7 @@
-use crate::cell::Cell::{self, *};
+use super::cell::Cell::{self, *};
 use std::{collections::HashMap, ops::Index};
 
-use crate::oldchunk::{Chunk, MASK_X, MASK_Y, SHIFT_X, SHIFT_Y};
+use super::chunk::{Chunk, MASK_X, MASK_Y, SHIFT_X, SHIFT_Y};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InfiniteFlatWorld {
