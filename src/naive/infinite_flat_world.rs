@@ -35,161 +35,152 @@ impl InfiniteFlatWorld {
     }
 
     pub fn clock(&mut self) {
+        // We only allocate one empty chunk per tick, keeping the stack lean
         let empty = Chunk::empty();
-
-        macro_rules! get {
-            ($x:expr, $y:expr) => {
-                self.active_chunks.get(&($x, $y)).copied()
-            };
-        }
-        macro_rules! or_empty {
-            ($target:ident . $name:ident ($($chunk:expr),* $(,)?)) => {
-                $target.$name($(&$chunk.unwrap_or(empty)),*)
-            };
-            ($target:ident :: $name:ident ($($chunk:expr),* $(,)?)) => {
-                $target::$name($(&$chunk.unwrap_or(empty)),*)
-            }
-        }
-
         let active_chunk_coords: Vec<_> = self.active_chunks.keys().copied().collect();
 
         for &(x, y) in &active_chunk_coords {
-            let top = get!(x, y + 1);
-            let top_right = get!(x + 1, y + 1);
-            let right = get!(x + 1, y);
-            let bottom_right = get!(x + 1, y - 1);
-            let bottom = get!(x, y - 1);
-            let bottom_left = get!(x - 1, y - 1);
-            let left = get!(x - 1, y);
-            let top_left = get!(x - 1, y + 1);
+            // 1. Temporarily pop the center chunk out of the map.
+            // This gives us an owned `mut` chunk without borrowing the map.
+            let mut chunk = self.active_chunks.remove(&(x, y)).unwrap();
 
-            let chunk = self.active_chunks.get_mut(&(x, y)).unwrap();
+            // 2. A macro to inline map lookups and fall back to references of `empty`
+            macro_rules! get {
+                ($x:expr, $y:expr) => {
+                    self.active_chunks.get(&($x, $y)).unwrap_or(&empty)
+                };
+            }
 
-            or_empty!(chunk.check(
-                top,
-                top_right,
-                right,
-                bottom_right,
-                bottom,
-                bottom_left,
-                left,
-                top_left,
-            ));
+            // 3. Process the main rules. The immutable borrows of the map
+            // end immediately when this function call finishes.
+            chunk.check(
+                get!(x, y + 1),
+                get!(x + 1, y + 1),
+                get!(x + 1, y),
+                get!(x + 1, y - 1),
+                get!(x, y - 1),
+                get!(x - 1, y - 1),
+                get!(x - 1, y),
+                get!(x - 1, y + 1),
+            );
 
-            let chunk = Some(*chunk);
-
-            if top.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
+            // 4. Process borders. Because we don't save `get!()` to a variable,
+            // we are free to call `.insert()` immediately after!
+            if !self.active_chunks.contains_key(&(x, y + 1)) {
+                if let Some(new_chunk) = Chunk::check_borders(
                     get!(x, y + 2),
                     get!(x + 1, y + 2),
-                    top_right,
-                    right,
-                    chunk,
-                    left,
-                    top_left,
+                    get!(x + 1, y + 1),
+                    get!(x + 1, y),
+                    &chunk,
+                    get!(x - 1, y),
+                    get!(x - 1, y + 1),
                     get!(x - 1, y + 2),
-                )) {
+                ) {
                     self.active_chunks.insert((x, y + 1), new_chunk);
                 }
             }
-            if top_right.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
+            if !self.active_chunks.contains_key(&(x + 1, y + 1)) {
+                if let Some(new_chunk) = Chunk::check_borders(
                     get!(x + 1, y + 2),
                     get!(x + 2, y + 2),
                     get!(x + 2, y + 1),
                     get!(x + 2, y),
-                    right,
-                    chunk,
-                    top,
+                    get!(x + 1, y),
+                    &chunk,
+                    get!(x, y + 1),
                     get!(x, y + 2),
-                )) {
+                ) {
                     self.active_chunks.insert((x + 1, y + 1), new_chunk);
                 }
             }
-            if right.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    top_right,
+            if !self.active_chunks.contains_key(&(x + 1, y)) {
+                if let Some(new_chunk) = Chunk::check_borders(
+                    get!(x + 1, y + 1),
                     get!(x + 2, y + 1),
                     get!(x + 2, y),
                     get!(x + 2, y - 1),
-                    bottom_right,
-                    bottom,
-                    chunk,
-                    top
-                )) {
+                    get!(x + 1, y - 1),
+                    get!(x, y - 1),
+                    &chunk,
+                    get!(x, y + 1),
+                ) {
                     self.active_chunks.insert((x + 1, y), new_chunk);
                 }
             }
-            if bottom_right.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    right,
+            if !self.active_chunks.contains_key(&(x + 1, y - 1)) {
+                if let Some(new_chunk) = Chunk::check_borders(
+                    get!(x + 1, y),
                     get!(x + 2, y),
                     get!(x + 2, y - 1),
                     get!(x + 2, y - 2),
                     get!(x + 1, y - 2),
                     get!(x, y - 2),
-                    bottom,
-                    chunk
-                )) {
+                    get!(x, y - 1),
+                    &chunk,
+                ) {
                     self.active_chunks.insert((x + 1, y - 1), new_chunk);
                 }
             }
-            if bottom.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    chunk,
-                    right,
-                    bottom_right,
+            if !self.active_chunks.contains_key(&(x, y - 1)) {
+                if let Some(new_chunk) = Chunk::check_borders(
+                    &chunk,
+                    get!(x + 1, y),
+                    get!(x + 1, y - 1),
                     get!(x + 1, y - 2),
                     get!(x, y - 2),
                     get!(x - 1, y - 2),
-                    bottom_left,
-                    left
-                )) {
+                    get!(x - 1, y - 1),
+                    get!(x - 1, y),
+                ) {
                     self.active_chunks.insert((x, y - 1), new_chunk);
                 }
             }
-            if bottom_left.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    left,
-                    chunk,
-                    bottom,
+            if !self.active_chunks.contains_key(&(x - 1, y - 1)) {
+                if let Some(new_chunk) = Chunk::check_borders(
+                    get!(x - 1, y),
+                    &chunk,
+                    get!(x, y - 1),
                     get!(x, y - 2),
                     get!(x - 1, y - 2),
                     get!(x - 2, y - 2),
                     get!(x - 2, y - 1),
                     get!(x - 2, y),
-                )) {
+                ) {
                     self.active_chunks.insert((x - 1, y - 1), new_chunk);
                 }
             }
-            if left.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
-                    top_left,
-                    top,
-                    chunk,
-                    bottom,
-                    bottom_left,
+            if !self.active_chunks.contains_key(&(x - 1, y)) {
+                if let Some(new_chunk) = Chunk::check_borders(
+                    get!(x - 1, y + 1),
+                    get!(x, y + 1),
+                    &chunk,
+                    get!(x, y - 1),
+                    get!(x - 1, y - 1),
                     get!(x - 2, y - 1),
                     get!(x - 2, y),
-                    get!(x - 2, y + 1)
-                )) {
+                    get!(x - 2, y + 1),
+                ) {
                     self.active_chunks.insert((x - 1, y), new_chunk);
                 }
             }
-            if top_left.is_none() {
-                if let Some(new_chunk) = or_empty!(Chunk::check_borders(
+            if !self.active_chunks.contains_key(&(x - 1, y + 1)) {
+                if let Some(new_chunk) = Chunk::check_borders(
                     get!(x - 1, y + 2),
                     get!(x, y + 2),
-                    top,
-                    chunk,
-                    left,
+                    get!(x, y + 1),
+                    &chunk,
+                    get!(x - 1, y),
                     get!(x - 2, y),
                     get!(x - 2, y + 1),
-                    get!(x - 2, y + 2)
-                )) {
+                    get!(x - 2, y + 2),
+                ) {
                     self.active_chunks.insert((x - 1, y + 1), new_chunk);
                 }
             }
+
+            // 5. Put the mutated chunk back into the map safely!
+            self.active_chunks.insert((x, y), chunk);
         }
 
         self.active_chunks.retain(|_, chunk| chunk.will_be_active());

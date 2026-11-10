@@ -5,10 +5,12 @@ use std::ops::Index;
 
 use rand::Rng;
 
+use crate::chunk::SIZE;
+
 use super::cell::Cell::{self, *};
 
-pub(super) const SHIFT_X: usize = 4;
-pub(super) const SHIFT_Y: usize = 4;
+pub(super) const SHIFT_X: usize = SIZE.trailing_zeros() as _;
+pub(super) const SHIFT_Y: usize = SHIFT_X;
 
 pub(super) const SIZE_X: usize = 1 << SHIFT_X;
 pub(super) const SIZE_Y: usize = 1 << SHIFT_Y;
@@ -16,10 +18,16 @@ pub(super) const SIZE_Y: usize = 1 << SHIFT_Y;
 pub(super) const MASK_X: usize = SIZE_X - 1;
 pub(super) const MASK_Y: usize = SIZE_Y - 1;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Eq)]
 pub struct Chunk {
     data: [[Cell; SIZE_X]; SIZE_Y],
     alternate: [[Cell; SIZE_X]; SIZE_Y],
+}
+
+impl PartialEq for Chunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
 }
 
 impl<T> Index<(usize, T)> for Chunk
@@ -58,12 +66,15 @@ impl Chunk {
         chunk
     }
 
+    // In oldchunk.rs
+
     pub fn from_bytes(bytes: [[u8; SIZE_X / 8]; SIZE_Y]) -> Self {
         let mut chunk = Self::empty();
-        for (row, bytes) in zip(&mut chunk.data, bytes) {
-            for j in 0..SIZE_X {
-                let bit = bytes[j / 8] & (0x80 >> (j % 8));
-                row[j] = (bit != 0).into();
+        for r in 0..SIZE_Y {
+            let y = SIZE_Y - 1 - r;
+            for x in 0..SIZE_X {
+                let bit = bytes[r][x / 8] & (0x80 >> (x % 8));
+                chunk.data[x][y] = (bit != 0).into();
             }
         }
         chunk

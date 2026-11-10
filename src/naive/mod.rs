@@ -1,3 +1,3 @@
-mod cell;
-mod chunk;
-mod infinite_flat_world;
+pub(crate) mod cell;
+pub(crate) mod chunk;
+pub(crate) mod infinite_flat_world;

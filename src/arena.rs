@@ -83,34 +83,54 @@ impl Arena {
         batch: &Batch<'_>,
         alive_dsts: &mut [ChunkRef],
         dead_dsts: &mut [ChunkRef],
-        results: &mut [Activity],
+        results: &mut Vec<Activity>,
     ) {
-        let alive_len = batch.alive_srcs.len();
-        let start_idx = results.len();
+        let total_len = alive_dsts.len() + dead_dsts.len();
 
-        let (alive_results, dead_results) = results[start_idx..].split_at_mut(alive_len);
+        if total_len < 128 {
+            results.extend(
+                batch
+                    .alive_srcs
+                    .iter()
+                    .zip(&batch.alive_nbhds)
+                    .zip(alive_dsts)
+                    .map(|((&src, &neighbors), dst)| {
+                        self.get(src)
+                            .apply_rules(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
+                    }),
+            );
 
-        batch
-            .alive_srcs
-            .par_iter()
-            .zip_eq(&batch.alive_nbhds)
-            .zip_eq(alive_dsts)
-            .zip_eq(alive_results)
-            .for_each(|(((&src, &neighbors), dst), result)| {
-                *result = self
-                    .get(src)
-                    .apply_rules(neighbors.map(|idx| self.get(idx)), self.get_mut(dst));
-            });
+            results.extend(
+                batch
+                    .dead_nbhds
+                    .iter()
+                    .zip(dead_dsts)
+                    .map(|(&neighbors, dst)| {
+                        Chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
+                    }),
+            );
+        } else {
+            let alive_results = batch
+                .alive_srcs
+                .par_iter()
+                .zip(&batch.alive_nbhds)
+                .zip(alive_dsts)
+                .map(|((&src, &neighbors), dst)| {
+                    self.get(src)
+                        .apply_rules(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
+                });
 
-        batch
-            .dead_nbhds
-            .par_iter()
-            .zip_eq(dead_dsts)
-            .zip_eq(dead_results)
-            .for_each(|((&neighbors, dst), result)| {
-                *result =
-                    Chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst));
-            });
+            let dead_results =
+                batch
+                    .dead_nbhds
+                    .par_iter()
+                    .zip(dead_dsts)
+                    .map(|(&neighbors, dst)| {
+                        Chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
+                    });
+
+            alive_results.chain(dead_results).collect_into_vec(results);
+        }
     }
 }
 
@@ -143,10 +163,6 @@ impl<'a> Batch<'a> {
     }
 
     pub(crate) fn reinterpret<'b>(self) -> Batch<'b> {
-        assert!(
-            self.alive_srcs.is_empty() && self.alive_nbhds.is_empty() && self.dead_nbhds.is_empty()
-        );
-
         unsafe {
             Batch {
                 alive_srcs: recycle_vec(self.alive_srcs),

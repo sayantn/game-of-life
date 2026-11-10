@@ -112,7 +112,7 @@ impl RawInfiniteFlatWorld {
         alive_dsts: &mut Vec<ChunkRef>,
         dead_dsts: &mut Vec<ChunkRef>,
         results_buf: &mut Vec<Activity>,
-    ) {
+    ) -> (usize, usize) {
         macro_rules! get_neighbors {
             ($links: expr) => {
                 $links.map(|neighbor| {
@@ -131,17 +131,19 @@ impl RawInfiniteFlatWorld {
             batch.push_alive(node.chunk.read(), get_neighbors!(node.links));
             alive_dsts.push(self.arena.alloc());
 
-            for (dir, &neighbor) in node.links.iter() {
-                if neighbor.is_some() {
+            for dir in [Dir::N, Dir::W, Dir::E, Dir::S] {
+                if !node.activity.edge(dir) {
+                    continue;
+                }
+
+                if node.links[dir].is_some() {
                     continue;
                 }
 
                 let coord = node.coord.step(dir);
-                if checked.contains(&coord) {
+                if !checked.insert(coord) {
                     continue;
                 }
-
-                checked.insert(coord);
 
                 let links = Links::from_fn(|other_dir| {
                     let (dx, dy) = add(dir.offset(), other_dir.offset());
@@ -152,15 +154,6 @@ impl RawInfiniteFlatWorld {
                     }
                 });
 
-                if ![Dir::N, Dir::W, Dir::E, Dir::S].into_iter().any(|dir| {
-                    links[dir].map_or(false, |node_id| {
-                        self.nodes[node_id].activity.is_edge_active(dir.opposite())
-                    })
-                }) {
-                    // if no adjacent edges are active then we don't need to check anything
-                    continue;
-                }
-
                 coords_buf.push(coord);
                 batch.push_dead(get_neighbors!(links));
                 dead_dsts.push(self.arena.alloc());
@@ -170,6 +163,8 @@ impl RawInfiniteFlatWorld {
         self.arena
             .compute_batched(&batch, alive_dsts, dead_dsts, results_buf);
 
+        let (alive_chunks_checked, dead_chunks_checked) = (alive_dsts.len(), dead_dsts.len());
+
         *static_batch = batch.reinterpret();
 
         for (node_id, (chunk, activity)) in
@@ -177,7 +172,7 @@ impl RawInfiniteFlatWorld {
                 .enumerate()
                 .rev()
         {
-            if activity.is_active() {
+            if activity.chunk() {
                 let node = &mut self.nodes[node_id];
                 self.arena.dealloc(mem::replace(&mut node.chunk, chunk));
                 node.activity = activity;
@@ -191,12 +186,14 @@ impl RawInfiniteFlatWorld {
             coords_buf.drain(..),
             zip(dead_dsts.drain(..), results_buf.drain(..)),
         ) {
-            if activity.is_active() {
+            if activity.chunk() {
                 self.create(coord, chunk, activity);
             } else {
                 self.arena.dealloc(chunk);
             }
         }
+
+        (alive_chunks_checked, dead_chunks_checked)
     }
 }
 
@@ -258,7 +255,11 @@ impl InfiniteFlatWorld {
         Some(dst)
     }
 
-    pub fn clock(&mut self) {
+    pub fn active_chunks(&self) -> usize {
+        self.raw.nodes.len()
+    }
+
+    pub fn clock(&mut self) -> (usize, usize) {
         self.raw.clock(
             &mut self.checked,
             &mut self.coords_buf,
@@ -266,7 +267,7 @@ impl InfiniteFlatWorld {
             &mut self.alive_dsts,
             &mut self.dead_dsts,
             &mut self.results_buf,
-        );
+        )
     }
 }
 
@@ -304,6 +305,80 @@ impl Clone for InfiniteFlatWorld {
             alive_dsts: Vec::new(),
             dead_dsts: Vec::new(),
             results_buf: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::collections::HashSet;
+
+    // Adjust imports as necessary for your module structure
+    use crate::chunk::Chunk as NewChunk;
+    use crate::infinite_flat_world_2::{Coord, InfiniteFlatWorld as NewWorld};
+
+    use crate::naive::chunk::Chunk as OldChunk;
+    use crate::naive::infinite_flat_world::InfiniteFlatWorld as OldWorld;
+
+    #[test]
+    fn test_infinite_flat_world_topology_matches_naive() {
+        let mut rng = StdRng::seed_from_u64(1337);
+        let mut old_world = OldWorld::empty();
+        let mut new_world = NewWorld::empty();
+
+        // 1. Seed a dense cluster of random chunks around the origin
+        let seed_coords = [(0, 0), (1, 0), (0, 1), (-1, -1), (1, 1)];
+        for &(cx, cy) in &seed_coords {
+            let new_chunk = NewChunk::random(&mut rng);
+            let old_chunk = OldChunk::from_bytes(new_chunk.to_bytes());
+
+            new_world.insert_chunk(Coord { x: cx, y: cy }, new_chunk);
+            old_world
+                .active_chunks
+                .insert((cx as i128, cy as i128), old_chunk);
+        }
+
+        // 2. Tick both simulations forward heavily to force border expansions and chunk culling
+        for i in 1..=15 {
+            old_world.clock();
+            new_world.clock();
+
+            // 3. Verify that the optimized world successfully routed and tracked every single active chunk
+            for (&(cx, cy), old_chunk) in &old_world.active_chunks {
+                let new_chunk = new_world
+                    .load_chunk(Coord {
+                        x: cx as i64,
+                        y: cy as i64,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("Gen {i}: Optimized world missing chunk at ({cx}, {cy})")
+                    });
+
+                let old_from_new = OldChunk::from_bytes(new_chunk.to_bytes());
+
+                assert_eq!(
+                    old_chunk, &old_from_new,
+                    "Gen {i}: Mismatch inside chunk ({cx}, {cy})"
+                );
+            }
+
+            // 4. Verify the optimized world didn't leak "ghost" chunks that should have been pruned
+            // Extract the active coordinate footprint from both engines
+            let new_chunk_coords: HashSet<(i128, i128)> = new_world
+                .raw
+                .nodes
+                .iter()
+                .map(|n| (n.coord.x as i128, n.coord.y as i128))
+                .collect();
+
+            let old_chunk_coords: HashSet<(i128, i128)> =
+                old_world.active_chunks.keys().copied().collect();
+
+            assert_eq!(
+                new_chunk_coords, old_chunk_coords,
+                "Gen {i}: Active chunk footprint mismatch! The Arena routing diverged from the naive hashmap."
+            );
         }
     }
 }

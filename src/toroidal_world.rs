@@ -78,61 +78,71 @@ impl ToroidalWorld {
 }
 
 #[cfg(test)]
-mod oracle {
+mod tests {
     use super::*;
-    use crate::chunk::SIZE;
     use rand::{SeedableRng, rngs::StdRng};
 
-    /// Flatten the world into a global bool grid, row-major.
-    pub fn cells(w: &ToroidalWorld) -> Vec<Vec<bool>> {
-        let (vh, hh) = (w.v_chunks, w.h_chunks);
-        let mut g = vec![vec![false; hh * SIZE]; vh * SIZE];
-        for ci in 0..vh {
-            for cj in 0..hh {
-                let bytes = w.chunks[ci * hh + cj].to_bytes();
-                for r in 0..SIZE {
-                    for c in 0..SIZE {
-                        g[ci * SIZE + r][cj * SIZE + c] = bytes[r][c / 8] & (0x80 >> (c % 8)) != 0;
-                    }
-                }
-            }
-        }
-        g
-    }
-
-    /// One generation of GoL on a torus, written as plainly as possible.
-    pub fn step(g: &[Vec<bool>]) -> Vec<Vec<bool>> {
-        let (h, w) = (g.len(), g[0].len());
-        let mut out = vec![vec![false; w]; h];
-        for y in 0..h {
-            for x in 0..w {
-                let mut n = 0;
-                for dy in 0..3 {
-                    for dx in 0..3 {
-                        if dy == 1 && dx == 1 {
-                            continue;
-                        }
-                        let yy = (y + h + dy - 1) % h;
-                        let xx = (x + w + dx - 1) % w;
-                        n += g[yy][xx] as u8;
-                    }
-                }
-                out[y][x] = matches!((g[y][x], n), (true, 2) | (_, 3));
-            }
-        }
-        out
-    }
+    use crate::chunk::Dir;
+    use crate::naive::chunk::Chunk as OldChunk;
 
     #[test]
-    fn matches_naive_on_random_worlds() {
-        for seed in 0..8u64 {
-            let mut world = ToroidalWorld::random(2, 2, &mut StdRng::seed_from_u64(seed));
-            let mut expected = cells(&world);
+    fn test_toroidal_world_matches_naive() {
+        let (h, v) = (2, 2);
+        let mut rng = StdRng::seed_from_u64(42);
 
-            for i in 0..50 {
-                world.clock();
-                expected = step(&expected);
-                assert_eq!(cells(&world), expected, "seed {seed}, generation {i}");
+        let mut world = ToroidalWorld::random(h, v, &mut rng);
+
+        // Construct the matching naive world
+        let mut old_chunks: Vec<OldChunk> = world
+            .chunks
+            .iter()
+            .map(|c| OldChunk::from_bytes(c.to_bytes()))
+            .collect();
+
+        for i in 1..=50 {
+            world.clock();
+
+            // Step the naive world
+            let mut next_old = old_chunks.clone();
+
+            for i in 0..v {
+                let rows = [(i + v - 1) % v, i, (i + 1) % v];
+                for j in 0..h {
+                    let cols = [(j + h - 1) % h, j, (j + 1) % h];
+
+                    let get_old = |dir: Dir| {
+                        let (dx, dy) = dir.offset();
+                        &old_chunks[rows[(dy + 1) as usize] * h + cols[(dx + 1) as usize]]
+                    };
+
+                    next_old[i * h + j].check(
+                        get_old(Dir::N),
+                        get_old(Dir::NE),
+                        get_old(Dir::E),
+                        get_old(Dir::SE),
+                        get_old(Dir::S),
+                        get_old(Dir::SW),
+                        get_old(Dir::W),
+                        get_old(Dir::NW),
+                    );
+                }
+            }
+
+            for chunk in &mut next_old {
+                chunk.update();
+            }
+            old_chunks = next_old;
+
+            // Compare the two worlds
+            for (idx, new_chunk) in world.chunks.iter().enumerate() {
+                let old_from_new = OldChunk::from_bytes(new_chunk.to_bytes());
+                assert_eq!(
+                    old_chunks[idx],
+                    old_from_new,
+                    "Mismatch at generation {i}, chunk {idx} (row {}, col {})",
+                    idx / h,
+                    idx % h
+                );
             }
         }
     }

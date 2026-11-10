@@ -19,5 +19,6 @@ mod parse;
 mod row;
 pub mod toroidal_world;
 
+#[allow(unused)]
 #[cfg(test)]
 mod naive;

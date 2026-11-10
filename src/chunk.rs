@@ -154,46 +154,46 @@ impl Debug for Chunk {
 
 fn compute_activity(acc: Row, top_row: Row, bottom_row: Row) -> Activity {
     Activity {
-        is_active: acc != empty_row(),
-        is_top_active: top_row != empty_row(),
-        is_bottom_active: bottom_row != empty_row(),
-        left_right_activity: edge_cols(acc),
+        chunk: acc != empty_row(),
+        top: top_row != empty_row(),
+        bottom: bottom_row != empty_row(),
+        left_right: edge_cols(acc),
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct Activity {
-    left_right_activity: Lane,
-    is_active: bool,
-    is_top_active: bool,
-    is_bottom_active: bool,
+    left_right: Lane,
+    chunk: bool,
+    top: bool,
+    bottom: bool,
 }
 
 impl Activity {
     pub const ALL: Activity = Activity {
-        left_right_activity: !0,
-        is_active: true,
-        is_top_active: true,
-        is_bottom_active: true,
+        left_right: !0,
+        chunk: true,
+        top: true,
+        bottom: true,
     };
 
     pub const EMPTY: Activity = Activity {
-        left_right_activity: 0,
-        is_active: false,
-        is_top_active: false,
-        is_bottom_active: false,
+        left_right: 0,
+        chunk: false,
+        top: false,
+        bottom: false,
     };
 
-    pub fn is_active(self) -> bool {
-        self.is_active
+    pub fn chunk(self) -> bool {
+        self.chunk
     }
 
-    pub fn is_edge_active(self, dir: Dir) -> bool {
+    pub fn edge(self, dir: Dir) -> bool {
         match dir {
-            Dir::N => self.is_top_active,
-            Dir::W => self.left_right_activity >> 1 != 0,
-            Dir::E => self.left_right_activity << 1 != 0,
-            Dir::S => self.is_bottom_active,
+            Dir::N => self.top,
+            Dir::W => self.left_right >> 1 != 0,
+            Dir::E => self.left_right << 1 != 0,
+            Dir::S => self.bottom,
             _ => panic!("Not orthogonal direction: {dir:?}"),
         }
     }
@@ -232,28 +232,28 @@ impl Dir {
     #[inline]
     pub fn offset(self) -> (i64, i64) {
         match self {
-            Dir::NW => (-1, -1),
-            Dir::N => (0, -1),
-            Dir::NE => (1, -1),
+            Dir::NW => (-1, 1),
+            Dir::N => (0, 1),
+            Dir::NE => (1, 1),
             Dir::W => (-1, 0),
             Dir::E => (1, 0),
-            Dir::SW => (-1, 1),
-            Dir::S => (0, 1),
-            Dir::SE => (1, 1),
+            Dir::SW => (-1, -1),
+            Dir::S => (0, -1),
+            Dir::SE => (1, -1),
         }
     }
 
     #[inline]
     pub fn from_offset(dx: i64, dy: i64) -> Self {
         match (dx, dy) {
-            (-1, -1) => Dir::NW,
-            (0, -1) => Dir::N,
-            (1, -1) => Dir::NE,
+            (-1, 1) => Dir::NW,
+            (0, 1) => Dir::N,
+            (1, 1) => Dir::NE,
             (-1, 0) => Dir::W,
             (1, 0) => Dir::E,
-            (-1, 1) => Dir::SW,
-            (0, 1) => Dir::S,
-            (1, 1) => Dir::SE,
+            (-1, -1) => Dir::SW,
+            (0, -1) => Dir::S,
+            (1, -1) => Dir::SE,
             _ => panic!("({dx}, {dy}) is not a direction"),
         }
     }
@@ -283,11 +283,57 @@ impl<T> NeighborData<T> {
         Self(Dir::ALL.map(f))
     }
 
+    pub fn as_ref(&self) -> NeighborData<&T> {
+        NeighborData(self.0.each_ref())
+    }
+
     pub fn map<U>(self, f: impl FnMut(T) -> U) -> NeighborData<U> {
         NeighborData(self.0.map(f))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Dir, &T)> {
         Dir::ALL.into_iter().zip(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod chunk_compat_tests {
+    use rand::{SeedableRng, rngs::StdRng};
+
+    use crate::chunk::{Chunk as NewChunk, Dir, NeighborData};
+    use crate::naive::chunk::Chunk as OldChunk;
+
+    #[test]
+    fn test_chunk_bitwise_rules_match_naive() {
+        let mut rng = StdRng::seed_from_u64(42);
+
+        for _ in 0..50 {
+            let new_center = NewChunk::random(&mut rng);
+            let mut old_center = OldChunk::from_bytes(new_center.to_bytes());
+
+            let new_nbhd = NeighborData::from_fn(|_| NewChunk::random(&mut rng));
+
+            let old_nbhd = new_nbhd
+                .as_ref()
+                .map(|nc| OldChunk::from_bytes(nc.to_bytes()));
+
+            old_center.check(
+                &old_nbhd[Dir::N],
+                &old_nbhd[Dir::NE],
+                &old_nbhd[Dir::E],
+                &old_nbhd[Dir::SE],
+                &old_nbhd[Dir::S],
+                &old_nbhd[Dir::SW],
+                &old_nbhd[Dir::W],
+                &old_nbhd[Dir::NW],
+            );
+            old_center.update();
+
+            let mut dst = NewChunk::empty();
+            new_center.apply_rules(NeighborData::from_fn(|dir| &new_nbhd[dir]), &mut dst);
+
+            let old_from_new = OldChunk::from_bytes(dst.to_bytes());
+            assert_eq!(old_center, old_from_new);
+        }
     }
 }
