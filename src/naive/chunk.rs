@@ -5,11 +5,12 @@ use std::ops::Index;
 
 use rand::Rng;
 
-use crate::chunk::SIZE;
+use crate::backend::SimdChunk;
+use crate::traits::Chunk;
 
 use super::cell::Cell::{self, *};
 
-pub(super) const SHIFT_X: usize = SIZE.trailing_zeros() as _;
+pub(super) const SHIFT_X: usize = SimdChunk::SIZE.trailing_zeros() as _;
 pub(super) const SHIFT_Y: usize = SHIFT_X;
 
 pub(super) const SIZE_X: usize = 1 << SHIFT_X;
@@ -19,18 +20,18 @@ pub(super) const MASK_X: usize = SIZE_X - 1;
 pub(super) const MASK_Y: usize = SIZE_Y - 1;
 
 #[derive(Copy, Clone, Eq)]
-pub struct Chunk {
+pub struct NaiveChunk {
     data: [[Cell; SIZE_X]; SIZE_Y],
     alternate: [[Cell; SIZE_X]; SIZE_Y],
 }
 
-impl PartialEq for Chunk {
+impl PartialEq for NaiveChunk {
     fn eq(&self, other: &Self) -> bool {
         self.data == other.data
     }
 }
 
-impl<T> Index<(usize, T)> for Chunk
+impl<T> Index<(usize, T)> for NaiveChunk
 where
     [Cell]: Index<T>,
 {
@@ -47,7 +48,7 @@ fn is_active<const N: usize>(cells: &[[Cell; N]]) -> bool {
         .any(|row| row.iter().any(|alive| *alive == Alive))
 }
 
-impl Chunk {
+impl NaiveChunk {
     pub fn empty() -> Self {
         Self {
             data: [[Dead; _]; _],
@@ -56,7 +57,7 @@ impl Chunk {
     }
 
     pub fn random() -> Self {
-        let mut chunk = Chunk::empty();
+        let mut chunk = NaiveChunk::empty();
         let mut rng = rand::rng();
         for row in &mut chunk.data {
             for cell in row {
@@ -66,14 +67,12 @@ impl Chunk {
         chunk
     }
 
-    // In oldchunk.rs
-
-    pub fn from_bytes(bytes: [[u8; SIZE_X / 8]; SIZE_Y]) -> Self {
+    pub fn from_bytes(bytes: [u8; SIZE_X * SIZE_Y / 8]) -> Self {
         let mut chunk = Self::empty();
         for r in 0..SIZE_Y {
             let y = SIZE_Y - 1 - r;
             for x in 0..SIZE_X {
-                let bit = bytes[r][x / 8] & (0x80 >> (x % 8));
+                let bit = bytes[SIZE_X / 8 * r + x / 8] & (0x80 >> (x % 8));
                 chunk.data[x][y] = (bit != 0).into();
             }
         }
@@ -99,14 +98,14 @@ impl Chunk {
 
     pub fn check(
         &mut self,
-        top: &Chunk,
-        top_right: &Chunk,
-        right: &Chunk,
-        bottom_right: &Chunk,
-        bottom: &Chunk,
-        bottom_left: &Chunk,
-        left: &Chunk,
-        top_left: &Chunk,
+        top: &NaiveChunk,
+        top_right: &NaiveChunk,
+        right: &NaiveChunk,
+        bottom_right: &NaiveChunk,
+        bottom: &NaiveChunk,
+        bottom_left: &NaiveChunk,
+        left: &NaiveChunk,
+        top_left: &NaiveChunk,
     ) {
         self.alternate.fill([Dead; _]);
 
@@ -249,15 +248,15 @@ impl Chunk {
     }
 
     pub fn check_borders(
-        top: &Chunk,
-        top_right: &Chunk,
-        right: &Chunk,
-        bottom_right: &Chunk,
-        bottom: &Chunk,
-        bottom_left: &Chunk,
-        left: &Chunk,
-        top_left: &Chunk,
-    ) -> Option<Chunk> {
+        top: &NaiveChunk,
+        top_right: &NaiveChunk,
+        right: &NaiveChunk,
+        bottom_right: &NaiveChunk,
+        bottom: &NaiveChunk,
+        bottom_left: &NaiveChunk,
+        left: &NaiveChunk,
+        top_left: &NaiveChunk,
+    ) -> Option<NaiveChunk> {
         let mut output = [[Dead; _]; _];
 
         let mut apply_rules = |x: usize, y, num_neighbours| {
@@ -345,7 +344,7 @@ impl Chunk {
         );
 
         if is_active(&output) {
-            Some(Chunk {
+            Some(NaiveChunk {
                 data: [[Dead; _]; _],
                 alternate: output,
             })
@@ -359,7 +358,7 @@ impl Chunk {
     }
 }
 
-impl Display for Chunk {
+impl Display for NaiveChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for y in (0..SIZE_Y).rev() {
             f.write_char('\n')?;
@@ -374,7 +373,7 @@ impl Display for Chunk {
     }
 }
 
-impl Debug for Chunk {
+impl Debug for NaiveChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self, f)
     }

@@ -1,24 +1,33 @@
+use std::iter::FusedIterator;
 use std::mem;
 
 use rand::Rng;
+use rand::distr::{Distribution, StandardUniform};
 
-use crate::chunk::{self, Chunk, NeighborData};
+use crate::primitives::NeighborData;
+use crate::traits::{Backend, Batch, Buffer, Chunk, Owned};
 
-#[derive(Clone)]
-pub struct ToroidalWorld {
-    chunks: Box<[Chunk]>,
-    alternate: Box<[Chunk]>,
+pub struct ToroidalWorld<B: Backend> {
+    buffer: B::Buffer,
+    chunks: Box<[<B::Buffer as Buffer>::Owned]>,
+    alternate: Box<[<B::Buffer as Buffer>::Owned]>,
     topology: Box<[NeighborData<usize>]>,
+
+    batch: Batch<'static, B::Buffer>,
+    results: Vec<B::Activity>,
     // v_chunks: usize,
     // h_chunks: usize,
 }
 
-impl ToroidalWorld {
+impl<B: Backend> ToroidalWorld<B> {
     pub fn from_fn(
+        config: <B::Buffer as Buffer>::Config,
         h_chunks: usize,
         v_chunks: usize,
-        mut f: impl FnMut(usize, usize) -> Chunk,
+        mut f: impl FnMut(usize, usize) -> B::Chunk,
     ) -> Self {
+        let total_chunks = v_chunks * h_chunks;
+
         let topology = (0..v_chunks)
             .flat_map(|i| (0..h_chunks).map(move |j| (i, j)))
             .map(|(i, j)| {
@@ -36,55 +45,86 @@ impl ToroidalWorld {
             })
             .collect();
 
+        let mut chunks = Vec::new();
+
+        let mut buffer = <B::Buffer as Buffer>::new(config);
+        buffer.grow(2 * total_chunks, &mut chunks);
+
+        chunks.truncate(2 * total_chunks);
+        let alternate = chunks.split_off(total_chunks);
+
+        let chunk_values: Vec<_> = (0..v_chunks)
+            .flat_map(|i| (0..h_chunks).map(move |j| (i, j)))
+            .map(|(i, j)| f(i, j))
+            .collect();
+
+        unsafe { buffer.store_batched(&mut chunks, &chunk_values) };
+
         Self {
-            chunks: (0..v_chunks)
-                .flat_map(|i| (0..h_chunks).map(move |j| (i, j)))
-                .map(|(i, j)| f(i, j))
-                .collect(),
-            alternate: (0..v_chunks * h_chunks).map(|_| Chunk::empty()).collect(),
+            buffer,
+            chunks: chunks.into_boxed_slice(),
+            alternate: alternate.into_boxed_slice(),
             topology,
+            batch: Batch::new(),
+            results: Vec::new(),
             // v_chunks,
             // h_chunks,
         }
     }
 
-    pub fn random(h_chunks: usize, v_chunks: usize, rng: &mut impl Rng) -> Self {
-        Self::from_fn(h_chunks, v_chunks, |_, _| Chunk::random(rng))
+    pub fn random(
+        config: <B::Buffer as Buffer>::Config,
+        h_chunks: usize,
+        v_chunks: usize,
+        rng: &mut impl Rng,
+    ) -> Self
+    where
+        StandardUniform: Distribution<<B::Chunk as Chunk>::Bytes>,
+    {
+        Self::from_fn(config, h_chunks, v_chunks, |_, _| B::Chunk::random(rng))
     }
 
-    pub fn empty(h_chunks: usize, v_chunks: usize) -> Self {
-        Self::from_fn(h_chunks, v_chunks, |_, _| Chunk::empty())
+    pub fn empty(config: <B::Buffer as Buffer>::Config, h_chunks: usize, v_chunks: usize) -> Self {
+        Self::from_fn(config, h_chunks, v_chunks, |_, _| Chunk::empty())
     }
 
     pub fn num_cells(&self) -> usize {
-        self.chunks.len() * chunk::SIZE * chunk::SIZE
+        self.chunks.len() * <B::Chunk as Chunk>::SIZE * <B::Chunk as Chunk>::SIZE
     }
 
     pub fn num_alive(&self) -> usize {
-        self.chunks.iter().map(Chunk::num_alive).sum()
+        self.chunks_iter().map(|chunk| chunk.num_alive()).sum()
+    }
+
+    pub fn chunks_iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = B::Chunk> + DoubleEndedIterator + FusedIterator {
+        self.chunks
+            .iter()
+            .map(|chunk| unsafe { self.buffer.load(chunk.id()) })
     }
 
     pub fn clock(&mut self) {
-        let src = self.chunks.as_ref();
-        let dst = self.alternate.as_mut();
-        let topo = self.topology.as_ref();
+        let mut batch = mem::take(&mut self.batch).recycle();
 
-        let process =
-            |((src_chunk, dst_chunk), links): ((&Chunk, &mut Chunk), &NeighborData<usize>)| {
-                let nbhd = links.map(|idx| unsafe { src.get_unchecked(idx) });
-                src_chunk.apply_rules(nbhd, dst_chunk);
-            };
-
-        if cfg!(feature = "rayon") && self.chunks.len() >= 16 {
-            #[cfg(feature = "rayon")]
-            {
-                use rayon::prelude::*;
-
-                src.par_iter().zip(dst).zip(topo).for_each(process);
-            }
-        } else {
-            src.iter().zip(dst).zip(topo).for_each(process);
+        batch.reserve_alive(self.chunks.len());
+        for (chunk, links) in self.chunks.iter().zip(&self.topology) {
+            let nbhd = links.map(|idx| unsafe { self.chunks.get_unchecked(idx).id() });
+            batch.push_alive_within_capacity(chunk.id(), nbhd);
         }
+
+        self.results.clear();
+
+        unsafe {
+            self.buffer.compute_batched(
+                &batch,
+                &mut self.alternate,
+                &mut Vec::new(),
+                &mut self.results,
+            );
+        }
+
+        self.batch = batch.recycle();
 
         mem::swap(&mut self.chunks, &mut self.alternate);
     }
@@ -95,20 +135,20 @@ mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
 
-    use crate::chunk::Dir;
-    use crate::naive::chunk::Chunk as OldChunk;
+    use crate::backend::SimdBackend;
+    use crate::naive::chunk::NaiveChunk as OldChunk;
+    use crate::primitives::Dir;
 
     #[test]
     fn test_toroidal_world_matches_naive() {
         let (h, v) = (2, 2);
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut world = ToroidalWorld::random(h, v, &mut rng);
+        let mut world = ToroidalWorld::<SimdBackend>::random((), h, v, &mut rng);
 
         // Construct the matching naive world
         let mut old_chunks: Vec<OldChunk> = world
-            .chunks
-            .iter()
+            .chunks_iter()
             .map(|c| OldChunk::from_bytes(c.to_bytes()))
             .collect();
 
@@ -147,7 +187,7 @@ mod tests {
             old_chunks = next_old;
 
             // Compare the two worlds
-            for (idx, new_chunk) in world.chunks.iter().enumerate() {
+            for (idx, new_chunk) in world.chunks_iter().enumerate() {
                 let old_from_new = OldChunk::from_bytes(new_chunk.to_bytes());
                 assert_eq!(
                     old_chunks[idx],

@@ -1,4 +1,4 @@
-#![feature(portable_simd, vec_push_within_capacity)]
+#![feature(portable_simd, vec_push_within_capacity, sync_unsafe_cell)]
 #![cfg_attr(
     all(target_arch = "s390x", target_feature = "vector-enhancements-2"),
     feature(stdarch_s390x)
@@ -18,13 +18,20 @@
     clippy::return_self_not_must_use
 )]
 
-mod arena;
-pub mod chunk;
-// pub mod infinite_flat_world;
-pub mod infinite_flat_world_2;
-mod parse;
-mod row;
-pub mod toroidal_world;
+pub mod arena;
+pub mod backend;
+pub mod helpers;
+mod infinite_flat_world;
+mod primitives;
+mod toroidal_world;
+mod traits;
+
+pub use arena::Arena;
+pub use backend::DefaultBackend;
+pub use infinite_flat_world::InfiniteFlatWorld;
+pub use primitives::*;
+pub use toroidal_world::ToroidalWorld;
+pub use traits::*;
 
 #[allow(unused)]
 #[cfg(test)]

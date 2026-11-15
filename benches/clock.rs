@@ -3,11 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use game_of_life::chunk::{self, Chunk, NeighborData};
-use game_of_life::infinite_flat_world_2::{Coord, InfiniteFlatWorld};
+use game_of_life::backend::{SimdBackend, SimdChunk};
+use game_of_life::{Chunk, Coord, InfiniteFlatWorld, ToroidalWorld};
 use rand::{SeedableRng, rngs::StdRng};
-
-use game_of_life::toroidal_world::ToroidalWorld;
 
 /// Generations per Criterion iteration. Set with `GOL_GENS=...`.
 fn gens_per_iter() -> u64 {
@@ -25,7 +23,8 @@ fn clock(c: &mut Criterion) {
     let mut group = c.benchmark_group("clock");
 
     for side in [2, 4, 10, 15, 20, 25, 30] {
-        let mut world = ToroidalWorld::random(side, side, &mut StdRng::seed_from_u64(42));
+        let mut world =
+            ToroidalWorld::<SimdBackend>::random((), side, side, &mut StdRng::seed_from_u64(42));
         let cells = world.num_cells() as u64;
 
         // One iteration is `gens` generations, so throughput is per iteration.
@@ -57,36 +56,12 @@ fn clock(c: &mut Criterion) {
     group.finish();
 }
 
-fn single_chunk(c: &mut Criterion) {
-    let mut group = c.benchmark_group("apply_rules_single_chunk");
-    group.throughput(Throughput::Elements((chunk::SIZE * chunk::SIZE) as u64));
-
-    let mut dst = Chunk::empty();
-    let live = Chunk::random(&mut StdRng::seed_from_u64(1));
-    let zero = Chunk::empty();
-
-    group.bench_function("known_empty", |b| {
-        let nbhd = NeighborData::from_fn(|_| black_box(&live));
-        b.iter(|| black_box(Chunk::check_activity(nbhd, black_box(&mut dst))))
-    });
-
-    // Opaque baselines: same data, but the compiler cannot see it.
-    group.bench_function("opaque_empty", |b| {
-        b.iter(|| {
-            let nbhd = NeighborData::from_fn(|_| black_box(&zero));
-            black_box(black_box(&live).apply_rules(nbhd, black_box(&mut dst)))
-        })
-    });
-
-    group.finish();
-}
-
 fn infinite_clock(c: &mut Criterion) {
     let gens = gens_per_iter();
     let mut group = c.benchmark_group("infinite_clock");
 
     for side in [2, 4, 10, 15, 20] {
-        let mut initial_world = InfiniteFlatWorld::empty();
+        let mut initial_world = InfiniteFlatWorld::<SimdBackend>::empty(());
         let mut rng = StdRng::seed_from_u64(42);
 
         // Seed a dense block of chunks
@@ -108,7 +83,7 @@ fn infinite_clock(c: &mut Criterion) {
             total_empty_evals += empty;
         }
 
-        let cells_per_chunk = (chunk::SIZE * chunk::SIZE) as u64;
+        let cells_per_chunk = (SimdChunk::SIZE * SimdChunk::SIZE) as u64;
         let total_chunks = (total_active_evals + total_empty_evals) as u64;
         let exact_cells_per_run = total_chunks * cells_per_chunk;
 
@@ -156,7 +131,7 @@ fn infinite_clock_sparse(c: &mut Criterion) {
     let mut group = c.benchmark_group("infinite_clock_sparse");
 
     for side in [2, 4, 10, 15, 20] {
-        let mut initial_world = InfiniteFlatWorld::empty();
+        let mut initial_world = InfiniteFlatWorld::<SimdBackend>::empty(());
         let mut rng = StdRng::seed_from_u64(42);
 
         // Seed the exact same number of chunks (side * side),
@@ -183,7 +158,7 @@ fn infinite_clock_sparse(c: &mut Criterion) {
             total_empty_evals += empty;
         }
 
-        let cells_per_chunk = (chunk::SIZE * chunk::SIZE) as u64;
+        let cells_per_chunk = (SimdChunk::SIZE * SimdChunk::SIZE) as u64;
         let exact_cells_per_run = (total_active_evals + total_empty_evals) as u64 * cells_per_chunk;
 
         group.throughput(Throughput::Elements(exact_cells_per_run));
@@ -225,6 +200,6 @@ fn infinite_clock_sparse(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(20);
-    targets = single_chunk, clock, infinite_clock, infinite_clock_sparse
+    targets =  clock, infinite_clock, infinite_clock_sparse
 }
 criterion_main!(benches);

@@ -12,7 +12,8 @@ name    = "clock"
 harness = false
 
 [features]
-parallel = ["rayon"]
+default = ["parallel"]
+parallel = ["dep:rayon"]
 
 [dependencies]
 fxhash = "0.2.1"

@@ -1,11 +1,11 @@
 use super::cell::Cell::{self, *};
 use std::{collections::HashMap, ops::Index};
 
-use super::chunk::{Chunk, MASK_X, MASK_Y, SHIFT_X, SHIFT_Y};
+use super::chunk::{NaiveChunk, MASK_X, MASK_Y, SHIFT_X, SHIFT_Y};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InfiniteFlatWorld {
-    pub active_chunks: HashMap<(i128, i128), Chunk>,
+    pub active_chunks: HashMap<(i128, i128), NaiveChunk>,
 }
 
 impl Index<(i128, i128)> for InfiniteFlatWorld {
@@ -30,13 +30,13 @@ impl InfiniteFlatWorld {
     pub fn toggle(&mut self, x: i128, y: i128) {
         self.active_chunks
             .entry((x >> SHIFT_X, y >> SHIFT_Y))
-            .or_insert_with(Chunk::empty)
+            .or_insert_with(NaiveChunk::empty)
             .toggle(x as usize & MASK_X, y as usize & MASK_Y);
     }
 
     pub fn clock(&mut self) {
         // We only allocate one empty chunk per tick, keeping the stack lean
-        let empty = Chunk::empty();
+        let empty = NaiveChunk::empty();
         let active_chunk_coords: Vec<_> = self.active_chunks.keys().copied().collect();
 
         for &(x, y) in &active_chunk_coords {
@@ -67,7 +67,7 @@ impl InfiniteFlatWorld {
             // 4. Process borders. Because we don't save `get!()` to a variable,
             // we are free to call `.insert()` immediately after!
             if !self.active_chunks.contains_key(&(x, y + 1)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x, y + 2),
                     get!(x + 1, y + 2),
                     get!(x + 1, y + 1),
@@ -81,7 +81,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x + 1, y + 1)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x + 1, y + 2),
                     get!(x + 2, y + 2),
                     get!(x + 2, y + 1),
@@ -95,7 +95,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x + 1, y)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x + 1, y + 1),
                     get!(x + 2, y + 1),
                     get!(x + 2, y),
@@ -109,7 +109,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x + 1, y - 1)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x + 1, y),
                     get!(x + 2, y),
                     get!(x + 2, y - 1),
@@ -123,7 +123,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x, y - 1)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     &chunk,
                     get!(x + 1, y),
                     get!(x + 1, y - 1),
@@ -137,7 +137,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x - 1, y - 1)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x - 1, y),
                     &chunk,
                     get!(x, y - 1),
@@ -151,7 +151,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x - 1, y)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x - 1, y + 1),
                     get!(x, y + 1),
                     &chunk,
@@ -165,7 +165,7 @@ impl InfiniteFlatWorld {
                 }
             }
             if !self.active_chunks.contains_key(&(x - 1, y + 1)) {
-                if let Some(new_chunk) = Chunk::check_borders(
+                if let Some(new_chunk) = NaiveChunk::check_borders(
                     get!(x - 1, y + 2),
                     get!(x, y + 2),
                     get!(x, y + 1),
