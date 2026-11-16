@@ -26,22 +26,27 @@ impl Chunk for SimdChunk {
 
     type Bytes = [u8; ROW_BYTES * ROW_BITS];
 
+    #[inline]
     fn empty() -> Self {
         Self::new([empty_row(); _])
     }
 
+    #[inline]
     fn from_bytes(bytes: &[u8; ROW_BYTES * ROW_BITS]) -> Self {
         Self::from(*bytes)
     }
 
+    #[inline]
     fn to_bytes(&self) -> [u8; ROW_BYTES * ROW_BITS] {
         self.clone().into()
     }
 
+    #[inline]
     fn num_alive(&self) -> usize {
         self.data.iter().copied().map(row_num_alive).sum()
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         for block in self.data.as_chunks::<16>().0 {
             // SAFETY: Each chunk from `as_chunks::<16>()` has length 16, so the iterator is non-empty.
@@ -54,7 +59,17 @@ impl Chunk for SimdChunk {
     }
 }
 
+impl Default for SimdChunk {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            data: [empty_row(); _],
+        }
+    }
+}
+
 impl From<[u8; ROW_BYTES * ROW_BITS]> for SimdChunk {
+    #[inline]
     fn from(value: [u8; ROW_BYTES * ROW_BITS]) -> Self {
         // SAFETY: `[u8; ROW_BYTES * ROW_BITS]` and `[[u8; ROW_BYTES]; ROW_BITS]` have identical
         // size, alignment (1), and bit validity.
@@ -64,6 +79,7 @@ impl From<[u8; ROW_BYTES * ROW_BITS]> for SimdChunk {
 }
 
 impl From<SimdChunk> for [u8; ROW_BYTES * ROW_BITS] {
+    #[inline]
     fn from(value: SimdChunk) -> Self {
         // SAFETY: `[[u8; ROW_BYTES]; ROW_BITS]` and `[u8; ROW_BYTES * ROW_BITS]` have identical
         // size, alignment (1), and bit validity.
@@ -72,6 +88,7 @@ impl From<SimdChunk> for [u8; ROW_BYTES * ROW_BITS] {
 }
 
 impl Debug for SimdChunk {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         helpers::print_chunk(f, self)
     }
@@ -80,6 +97,7 @@ impl Debug for SimdChunk {
 impl FromStr for SimdChunk {
     type Err = helpers::ParseError;
 
+    #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         helpers::parse_chunk(s)
     }
@@ -94,7 +112,7 @@ fn compute_activity(acc: Row, top_row: Row, bottom_row: Row) -> SimdActivity {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimdActivity {
     left_right: Lane,
     chunk: bool,
@@ -117,10 +135,12 @@ impl Activity for SimdActivity {
         bottom: false,
     };
 
+    #[inline]
     fn chunk(self) -> bool {
         self.chunk
     }
 
+    #[inline]
     fn edge(self, orth: Orth) -> bool {
         match orth {
             Orth::N => self.top,
@@ -131,6 +151,7 @@ impl Activity for SimdActivity {
     }
 }
 
+#[inline]
 pub(super) fn apply_rules(
     center: &SimdChunk,
     nbhd: NeighborData<&SimdChunk>,
@@ -182,6 +203,7 @@ pub(super) fn apply_rules(
     compute_activity(acc, dst.data[0], result)
 }
 
+#[inline]
 pub(super) fn check_activity(nbhd: NeighborData<&SimdChunk>, dst: &mut SimdChunk) -> SimdActivity {
     let left = &nbhd[Dir::W].data;
     let right = &nbhd[Dir::E].data;

@@ -18,27 +18,29 @@ impl Backend for SimdBackend {
     type Activity = SimdActivity;
 }
 
-/// Exclusive ownership handle for a single slot in [`CpuBuffer`].
+/// Exclusive ownership handle for a single slot in [`SimdBuffer`].
 ///
 /// Intentionally does not implement `Clone` or `Copy`.
+#[derive(Debug)]
 #[repr(transparent)]
 pub struct SimdOwned(usize);
 
 impl Owned for SimdOwned {
     type Id<'a> = SimdId<'a>;
 
+    #[inline]
     fn id(&self) -> Self::Id<'_> {
         SimdId(self.0, PhantomData)
     }
 }
 
-/// Lightweight, `Copy` read-only capability handle borrowing a slot in [`CpuBuffer`]
+/// Lightweight, `Copy` read-only capability handle borrowing a slot in [`SimdBuffer`]
 /// for lifetime `'a`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct SimdId<'a>(usize, PhantomData<&'a SimdOwned>);
 
-/// Host-memory slab backing [`CpuBackend`], storing chunks in contiguous `SyncUnsafeCell`s
+/// Host-memory slab backing [`SimdBackend`], storing chunks in contiguous `SyncUnsafeCell`s
 /// for lock-free parallel reads and disjoint writes.
 pub struct SimdBuffer {
     chunks: Vec<SyncUnsafeCell<SimdChunk>>,
@@ -60,6 +62,13 @@ impl SimdBuffer {
     }
 }
 
+impl Default for SimdBuffer {
+    #[inline]
+    fn default() -> Self {
+        Self::new(())
+    }
+}
+
 unsafe impl Buffer for SimdBuffer {
     type Config = ();
     type Chunk = SimdChunk;
@@ -67,12 +76,14 @@ unsafe impl Buffer for SimdBuffer {
     type Owned = SimdOwned;
     type Id<'a> = SimdId<'a>;
 
+    #[inline]
     fn new((): Self::Config) -> Self {
         Self { chunks: Vec::new() }
     }
 
-    fn empty_clone(&self) -> Self {
-        Self::new(())
+    #[inline]
+    fn config(&self) -> &Self::Config {
+        &()
     }
 
     #[inline]
@@ -80,6 +91,7 @@ unsafe impl Buffer for SimdBuffer {
         self.chunks.len()
     }
 
+    #[inline]
     fn grow(&mut self, additional: usize, out: &mut Vec<Self::Owned>) {
         if additional == 0 {
             return;
@@ -98,6 +110,7 @@ unsafe impl Buffer for SimdBuffer {
         out.extend((old_cap..new_cap).rev().map(SimdOwned));
     }
 
+    #[inline]
     fn grow_exact(&mut self, additional: usize, out: &mut Vec<Self::Owned>) {
         if additional == 0 {
             return;
@@ -105,7 +118,6 @@ unsafe impl Buffer for SimdBuffer {
 
         let old_cap = self.chunks.len();
         self.chunks.reserve_exact(additional);
-        // Expand up to the full amortized `Vec` capacity so subsequent growths are rare.
         let new_cap = self.chunks.capacity();
 
         self.chunks
@@ -134,6 +146,7 @@ unsafe impl Buffer for SimdBuffer {
         unsafe { from.get(src).clone_into(self.get_mut(dst)) };
     }
 
+    #[inline]
     unsafe fn compute_batched(
         &self,
         batch: &Batch<'_, Self>,
@@ -209,6 +222,78 @@ unsafe impl Buffer for SimdBuffer {
                         chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
                     }),
             );
+        }
+    }
+
+    #[inline]
+    unsafe fn step_batched(
+        &self,
+        batch: &Batch<'_, Self>,
+        alive_dsts: &mut [Self::Owned],
+        dead_dsts: &mut [Self::Owned],
+    ) {
+        assert_eq!(alive_dsts.len(), batch.alive_len());
+        assert_eq!(dead_dsts.len(), batch.dead_len());
+
+        let total_len = alive_dsts.len() + dead_dsts.len();
+
+        // SAFETY: Caller guarantees all source/neighbor IDs and destination `Owned` handles were
+        // minted by `self`, and the capability rules ensure no destination slot aliases any input
+        // or other destination slot.
+
+        if cfg!(feature = "parallel") && total_len >= 32 {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+
+                let alive_results = batch
+                    .alive_srcs()
+                    .par_iter()
+                    .zip(batch.alive_nbhds())
+                    .zip(alive_dsts)
+                    .map(|((&src, &neighbors), dst)| unsafe {
+                        chunk::apply_rules(
+                            self.get(src),
+                            neighbors.map(|idx| self.get(idx)),
+                            self.get_mut(dst),
+                        );
+                    });
+
+                let dead_results =
+                    batch
+                        .dead_nbhds()
+                        .par_iter()
+                        .zip(dead_dsts)
+                        .map(|(&neighbors, dst)| unsafe {
+                            chunk::check_activity(
+                                neighbors.map(|idx| self.get(idx)),
+                                self.get_mut(dst),
+                            );
+                        });
+
+                alive_results.chain(dead_results).for_each(drop);
+            }
+        } else {
+            batch
+                .alive_srcs()
+                .iter()
+                .zip(batch.alive_nbhds())
+                .zip(alive_dsts)
+                .for_each(|((&src, &neighbors), dst)| unsafe {
+                    chunk::apply_rules(
+                        self.get(src),
+                        neighbors.map(|idx| self.get(idx)),
+                        self.get_mut(dst),
+                    );
+                });
+
+            batch
+                .dead_nbhds()
+                .iter()
+                .zip(dead_dsts)
+                .for_each(|(&neighbors, dst)| unsafe {
+                    chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst));
+                });
         }
     }
 }

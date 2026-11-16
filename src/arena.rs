@@ -1,7 +1,6 @@
 use std::ops::Deref;
 
-use crate::traits::{Buffer, Chunk};
-use crate::{Backend, BufferOf, ConfigOf, OwnedOf};
+use crate::{Backend, Buffer, BufferOf, Chunk, ConfigOf, OwnedOf};
 
 /// Free-list slot allocator wrapping a [`Buffer`], recycling freed [`Owned`](crate::Owned)
 /// capability tokens in $O(1)$ without reallocating backing device or host memory.
@@ -15,6 +14,7 @@ pub struct Arena<B: Backend> {
 
 impl<B: Backend> Arena<B> {
     /// Creates an empty `Arena` with an initialized backend buffer and no pre-allocated slots.
+    #[inline]
     pub fn new(config: ConfigOf<B>) -> Self {
         Self {
             buffer: BufferOf::<B>::new(config),
@@ -25,6 +25,7 @@ impl<B: Backend> Arena<B> {
     /// Allocates a slot from the free list, growing the underlying [`Buffer`] if none are free.
     ///
     /// The returned slot's contents are unspecified and must be overwritten before reading.
+    #[inline]
     #[must_use]
     pub fn alloc(&mut self) -> OwnedOf<B> {
         self.free.pop().unwrap_or_else(|| {
@@ -36,6 +37,7 @@ impl<B: Backend> Arena<B> {
     }
 
     /// Allocates a slot initialized to all-dead cells (`Chunk::empty()`).
+    #[inline]
     #[must_use]
     pub fn alloc_zeroed(&mut self) -> OwnedOf<B> {
         self.own(&B::Chunk::empty())
@@ -46,11 +48,13 @@ impl<B: Backend> Arena<B> {
     /// # Safety
     /// - `idx` must have been minted by `self`'s backing [`Buffer`] (e.g., via [`alloc`](Self::alloc)
     ///   or [`own`](Self::own))
+    #[inline]
     pub unsafe fn dealloc(&mut self, idx: OwnedOf<B>) {
         self.free.push(idx);
     }
 
     /// Allocates a slot and initializes it with the contents of `chunk`.
+    #[inline]
     #[must_use]
     pub fn own(&mut self, chunk: &B::Chunk) -> OwnedOf<B> {
         let mut idx = self.alloc();
@@ -58,21 +62,23 @@ impl<B: Backend> Arena<B> {
         unsafe { self.buffer.store(&mut idx, chunk) };
         idx
     }
-
-    /// Creates a new, empty `Arena` sharing the same backend context/configuration as `self`
-    /// with an empty free list.
-    pub fn empty_clone(&self) -> Self {
-        Self {
-            buffer: self.buffer.empty_clone(),
-            free: Vec::new(),
-        }
-    }
 }
 
 impl<B: Backend> Deref for Arena<B> {
     type Target = BufferOf<B>;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.buffer
+    }
+}
+
+impl<B: Backend> Default for Arena<B>
+where
+    ConfigOf<B>: Default,
+{
+    #[inline]
+    fn default() -> Self {
+        Self::new(ConfigOf::<B>::default())
     }
 }

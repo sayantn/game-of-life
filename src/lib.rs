@@ -16,7 +16,7 @@
     clippy::wildcard_imports,
     clippy::doc_markdown
 )]
-#![deny(clippy::missing_safety_doc)]
+#![deny(clippy::missing_safety_doc, clippy::missing_inline_in_public_items)]
 
 pub mod arena;
 pub mod backend;

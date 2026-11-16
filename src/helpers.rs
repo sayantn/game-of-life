@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::traits::Chunk;
+use crate::Chunk;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -26,6 +26,7 @@ pub enum ParseError {
 }
 
 impl fmt::Display for ParseError {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::WrongRowCount { expected, found } => {
@@ -57,6 +58,7 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+#[inline]
 pub fn parse_chunk<C: Chunk>(s: &str) -> Result<C, ParseError> {
     let mut bytes = C::empty().to_bytes();
 
@@ -109,6 +111,7 @@ pub fn parse_chunk<C: Chunk>(s: &str) -> Result<C, ParseError> {
     Ok(C::from(bytes))
 }
 
+#[inline]
 pub fn print_chunk<C: Chunk>(f: &mut fmt::Formatter<'_>, chunk: &C) -> fmt::Result {
     let mut line = vec![b'\n'; C::SIZE + 1];
 

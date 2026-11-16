@@ -122,13 +122,12 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
             let _ = scratch.alive_dsts.push_within_capacity(self.arena.alloc());
 
             for orth in [Orth::N, Orth::W, Orth::E, Orth::S] {
-                if !node.activity.edge(orth) {
+                let dir = orth.dir();
+                if node.links[dir].is_some() {
                     continue;
                 }
 
-                let dir = orth.dir();
-
-                if node.links[dir].is_some() {
+                if !node.activity.edge(orth) {
                     continue;
                 }
 
@@ -234,15 +233,30 @@ impl<B: Backend> Clone for RawInfiniteFlatWorld<B> {
     }
 
     fn clone(&self) -> Self {
-        let mut new_arena = self.arena.empty_clone();
+        let mut new_arena = Arena::<B>::new(self.arena.config().clone());
         let mut dst = RawInfiniteFlatWorld {
-            empty: new_arena.alloc(),
+            empty: new_arena.alloc_zeroed(),
             arena: new_arena,
             nodes: Vec::new(),
             index: FxHashMap::default(),
         };
         dst.clone_from(self);
         dst
+    }
+}
+
+impl<B: Backend> Default for RawInfiniteFlatWorld<B>
+where
+    ConfigOf<B>: Default,
+{
+    fn default() -> Self {
+        let mut arena = Arena::<B>::default();
+        Self {
+            empty: arena.alloc_zeroed(),
+            arena,
+            nodes: Vec::default(),
+            index: FxHashMap::default(),
+        }
     }
 }
 
@@ -280,6 +294,7 @@ pub struct InfiniteFlatWorld<B: Backend = DefaultBackend> {
 
 impl<B: Backend> InfiniteFlatWorld<B> {
     /// Creates an empty infinite world with no active chunks.
+    #[inline]
     pub fn empty(config: ConfigOf<B>) -> Self {
         let mut arena = Arena::<B>::new(config);
         Self {
@@ -294,6 +309,7 @@ impl<B: Backend> InfiniteFlatWorld<B> {
     }
 
     /// Inserts or overwrites the chunk at chunk coordinates `coord`, marking all borders active.
+    #[inline]
     pub fn insert_chunk(&mut self, coord: Coord, chunk: &B::Chunk) {
         if let Some(&node_id) = self.raw.index.get(&coord) {
             let node = &mut self.raw.nodes[node_id];
@@ -307,6 +323,7 @@ impl<B: Backend> InfiniteFlatWorld<B> {
     }
 
     /// Returns a host copy of the chunk at `coord`, or `None` if that chunk is currently inactive.
+    #[inline]
     pub fn load_chunk(&self, coord: Coord) -> Option<B::Chunk> {
         Some(
             // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
@@ -319,6 +336,7 @@ impl<B: Backend> InfiniteFlatWorld<B> {
     }
 
     /// Copies the chunk at `coord` into `dst`, returning `None` if that chunk is inactive.
+    #[inline]
     pub fn load_chunk_to<'a>(
         &self,
         coord: Coord,
@@ -334,17 +352,20 @@ impl<B: Backend> InfiniteFlatWorld<B> {
     }
 
     /// Returns the number of currently tracked (non-empty) chunks in the simulation.
+    #[inline]
     pub fn active_chunks(&self) -> usize {
         self.raw.nodes.len()
     }
 
     /// Advances the simulation by one generation, returning `(alive_chunks_stepped, border_chunks_checked)`.
+    #[inline]
     pub fn clock(&mut self) -> (usize, usize) {
         self.raw.clock(&mut self.scratch)
     }
 }
 
 impl<B: Backend> Clone for InfiniteFlatWorld<B> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             raw: self.raw.clone(),
@@ -352,8 +373,43 @@ impl<B: Backend> Clone for InfiniteFlatWorld<B> {
         }
     }
 
+    #[inline]
     fn clone_from(&mut self, source: &Self) {
         self.raw.clone_from(&source.raw);
+    }
+}
+
+impl<B: Backend> Default for InfiniteFlatWorld<B>
+where
+    ConfigOf<B>: Default,
+{
+    #[inline]
+    fn default() -> Self {
+        Self {
+            raw: RawInfiniteFlatWorld::default(),
+            scratch: Scratch::default(),
+        }
+    }
+}
+
+impl<'a, B: Backend> Extend<(Coord, &'a B::Chunk)> for InfiniteFlatWorld<B> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = (Coord, &'a B::Chunk)>>(&mut self, iter: I) {
+        for (coord, chunk) in iter {
+            self.insert_chunk(coord, chunk);
+        }
+    }
+}
+
+impl<'a, B: Backend> FromIterator<(Coord, &'a B::Chunk)> for InfiniteFlatWorld<B>
+where
+    ConfigOf<B>: Default,
+{
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = (Coord, &'a B::Chunk)>>(iter: I) -> Self {
+        let mut ret = InfiniteFlatWorld::default();
+        ret.extend(iter);
+        ret
     }
 }
 
