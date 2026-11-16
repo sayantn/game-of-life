@@ -5,12 +5,11 @@ use std::ops::Index;
 
 use rand::Rng;
 
-use crate::backend::SimdChunk;
-use crate::traits::Chunk;
+use crate::Chunk;
 
 use super::cell::Cell::{self, *};
 
-pub(super) const SHIFT_X: usize = SimdChunk::SIZE.trailing_zeros() as _;
+pub(super) const SHIFT_X: usize = Chunk::SIZE.trailing_zeros() as _;
 pub(super) const SHIFT_Y: usize = SHIFT_X;
 
 pub(super) const SIZE_X: usize = 1 << SHIFT_X;
@@ -19,10 +18,10 @@ pub(super) const SIZE_Y: usize = 1 << SHIFT_Y;
 pub(super) const MASK_X: usize = SIZE_X - 1;
 pub(super) const MASK_Y: usize = SIZE_Y - 1;
 
-#[derive(Copy, Clone, Eq)]
+#[derive(Clone, Eq)]
 pub struct NaiveChunk {
-    data: [[Cell; SIZE_X]; SIZE_Y],
-    alternate: [[Cell; SIZE_X]; SIZE_Y],
+    data: Box<[[Cell; SIZE_X]; SIZE_Y]>,
+    alternate: Box<[[Cell; SIZE_X]; SIZE_Y]>,
 }
 
 impl PartialEq for NaiveChunk {
@@ -51,8 +50,8 @@ fn is_active<const N: usize>(cells: &[[Cell; N]]) -> bool {
 impl NaiveChunk {
     pub fn empty() -> Self {
         Self {
-            data: [[Dead; _]; _],
-            alternate: [[Dead; _]; _],
+            data: Box::new([[Dead; _]; _]),
+            alternate: Box::new([[Dead; _]; _]),
         }
     }
 
@@ -84,11 +83,11 @@ impl NaiveChunk {
     }
 
     pub fn is_active(&self) -> bool {
-        is_active(&self.data)
+        is_active(&*self.data)
     }
 
     pub fn will_be_active(&self) -> bool {
-        is_active(&self.alternate)
+        is_active(&*self.alternate)
     }
 
     fn apply_rules(&mut self, x: usize, y: usize, num_neighbours: u8) {
@@ -257,7 +256,7 @@ impl NaiveChunk {
         left: &NaiveChunk,
         top_left: &NaiveChunk,
     ) -> Option<NaiveChunk> {
-        let mut output = [[Dead; _]; _];
+        let mut output = Box::new([[Dead; _]; _]);
 
         let mut apply_rules = |x: usize, y, num_neighbours| {
             output[x][y] = (num_neighbours == 3).into();
@@ -343,9 +342,9 @@ impl NaiveChunk {
                 + left[(SIZE_X - 1, SIZE_Y - 2)],
         );
 
-        if is_active(&output) {
+        if is_active(&*output) {
             Some(NaiveChunk {
-                data: [[Dead; _]; _],
+                data: Box::new([[Dead; _]; _]),
                 alternate: output,
             })
         } else {

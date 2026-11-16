@@ -72,6 +72,11 @@ impl Dir {
         }
     }
 
+    /// Converts a 2D coordinate offset `(dx, dy)` strictly in the range `[-1, 1]` 
+    /// to its corresponding compass direction.
+    ///
+    /// # Panics
+    /// Panics if the offset is `(0, 0)` or if `dx` or `dy` are outside the range `[-1, 1]`.#[inline]
     #[inline]
     pub fn from_offset(dx: i64, dy: i64) -> Self {
         match (dx, dy) {
@@ -89,6 +94,7 @@ impl Dir {
 }
 
 /// Fixed-size container associating a value of type `T` with each of the 8 [`Dir`] neighbors.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NeighborData<T>([T; 8]);
 

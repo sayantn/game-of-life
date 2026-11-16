@@ -1,11 +1,13 @@
+use std::fmt::Debug;
 use std::iter::zip;
 use std::mem;
 
 use fxhash::{FxHashMap, FxHashSet};
 
+use crate::helpers::push_within_capacity;
 use crate::{
-    Activity, Arena, Backend, Batch, Buffer, ConfigOf, Coord, DefaultBackend, Dir, NeighborData,
-    Orth, Owned, OwnedOf,
+    Activity, Arena, Backend, Buffer, BufferOf, Chunk, ComputeJob, ConfigOf, Coord, DefaultBackend,
+    Dir, HandleOf, NeighborData, Orth, OwnedOf, StepScratch, VacantComputeJob,
 };
 
 type Links = NeighborData<Option<usize>>;
@@ -17,6 +19,27 @@ struct Node<B: Backend> {
     activity: B::Activity,
 }
 
+impl<B: Backend> Debug for Node<B>
+where
+    OwnedOf<B>: Debug,
+    B::Activity: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("coord", &self.coord)
+            .field("chunk", &self.chunk)
+            .field("links", &self.links)
+            .field("activity", &self.activity)
+            .finish()
+    }
+}
+
+/// Dense adjacency-list representation of the infinite Game of Life grid.
+///
+/// # Invariants
+/// - Every `Some(node_id)` in a node's `links` must point to a valid index in `nodes`.
+/// - If node A links to node B in direction D, node B must link to node A in direction `D.opposite()`.
+/// - Every allocated node must have a corresponding entry in `index` mapping back to its array position.
 struct RawInfiniteFlatWorld<B: Backend> {
     arena: Arena<B>,
     nodes: Vec<Node<B>>,
@@ -32,8 +55,6 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
     #[allow(unused)]
     #[cfg(debug_assertions)]
     fn check_invariants(&self) {
-        use crate::traits::Chunk;
-
         assert_eq!(self.index.len(), self.nodes.len());
 
         for (node_id, node) in self.nodes.iter().enumerate() {
@@ -47,7 +68,7 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
         }
 
         // SAFETY: `self.empty` was allocated from `self.arena`.
-        assert!(unsafe { self.arena.load(self.empty.id()).is_empty() });
+        assert!(unsafe { self.arena.load(self.empty.borrow()).is_empty() });
     }
 
     fn create(&mut self, coord: Coord, chunk: OwnedOf<B>, activity: B::Activity) {
@@ -104,22 +125,31 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
                             // is a valid index `< self.nodes.len()`.
                             unsafe { &self.nodes.get_unchecked(node_id).chunk }
                         })
-                        .id()
+                        .borrow()
                 })
             };
         }
 
-        let mut batch = mem::take(&mut scratch.batch).recycle();
+        let mut jobs = scratch.jobs.start_tick();
 
         scratch.checked.clear();
 
         let node_count = self.nodes.len();
-        batch.reserve_alive(node_count);
-        scratch.alive_dsts.reserve(node_count);
 
-        for (node_id, node) in self.nodes.iter().enumerate() {
-            batch.push_alive_within_capacity(node.chunk.id(), get_neighbors!(node.links));
-            let _ = scratch.alive_dsts.push_within_capacity(self.arena.alloc());
+        jobs.compute.reserve(node_count);
+        for _ in 0..node_count {
+            scratch.alive_dsts.push(self.arena.alloc());
+        }
+
+        for ((node_id, node), dst) in self.nodes.iter().enumerate().zip(&mut scratch.alive_dsts) {
+            push_within_capacity(
+                &mut jobs.compute,
+                ComputeJob {
+                    neighbors: get_neighbors!(node.links),
+                    center: node.chunk.borrow(),
+                    dst: dst.borrow_mut(),
+                },
+            );
 
             for orth in [Orth::N, Orth::W, Orth::E, Orth::S] {
                 let dir = orth.dir();
@@ -145,28 +175,40 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
                     }
                 });
 
-                scratch.coords_buf.push(coord);
-                batch.push_dead(get_neighbors!(links));
-                scratch.dead_dsts.push(self.arena.alloc());
+                scratch.vacant_buf.push((coord, links));
             }
+        }
+
+        let vacant_count = scratch.vacant_buf.len();
+
+        scratch.dead_dsts.reserve(vacant_count);
+        for _ in 0..vacant_count {
+            scratch.dead_dsts.push(self.arena.alloc());
+        }
+        jobs.vacant_compute.reserve(vacant_count);
+
+        for ((_, links), dst) in zip(&scratch.vacant_buf, &mut scratch.dead_dsts) {
+            push_within_capacity(
+                &mut jobs.vacant_compute,
+                VacantComputeJob {
+                    neighbors: get_neighbors!(links),
+                    dst: dst.borrow_mut(),
+                },
+            );
         }
 
         // SAFETY: Every ID in `batch` belongs to `self.empty` or a live node in `self.nodes`
         // (all allocated from `self.arena`), and every destination in `alive_dsts` and `dead_dsts`
         // was freshly allocated from `self.arena`.
         unsafe {
-            self.arena.compute_batched(
-                &batch,
-                &mut scratch.alive_dsts,
-                &mut scratch.dead_dsts,
-                &mut scratch.results_buf,
-            );
+            self.arena
+                .step_batched(&mut jobs, Some(&mut scratch.results_buf));
         }
 
         let (alive_chunks_checked, dead_chunks_checked) =
-            (scratch.alive_dsts.len(), scratch.dead_dsts.len());
+            (jobs.compute.len(), jobs.vacant_compute.len());
 
-        scratch.batch = batch.recycle();
+        scratch.jobs.finish_tick(jobs);
 
         for (node_id, (chunk, activity)) in zip(
             scratch.alive_dsts.drain(..),
@@ -188,8 +230,8 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
             }
         }
 
-        for (coord, (chunk, activity)) in zip(
-            scratch.coords_buf.drain(..),
+        for ((coord, _), (chunk, activity)) in zip(
+            scratch.vacant_buf.drain(..),
             zip(scratch.dead_dsts.drain(..), scratch.results_buf.drain(..)),
         ) {
             if activity.chunk() {
@@ -219,7 +261,7 @@ impl<B: Backend> Clone for RawInfiniteFlatWorld<B> {
             // SAFETY: `new_chunk` was minted by `self.arena` and `node.chunk` was minted by `source.arena`.
             unsafe {
                 self.arena
-                    .copy(&mut new_chunk, &source.arena, node.chunk.id());
+                    .copy(new_chunk.borrow_mut(), &source.arena, node.chunk.borrow());
             }
 
             Node {
@@ -247,7 +289,7 @@ impl<B: Backend> Clone for RawInfiniteFlatWorld<B> {
 
 impl<B: Backend> Default for RawInfiniteFlatWorld<B>
 where
-    ConfigOf<B>: Default,
+    BufferOf<B>: Default,
 {
     fn default() -> Self {
         let mut arena = Arena::<B>::default();
@@ -260,10 +302,24 @@ where
     }
 }
 
+impl<B: Backend> Debug for RawInfiniteFlatWorld<B>
+where
+    Arena<B>: Debug,
+    Node<B>: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfiniteFlatWorld")
+            .field("arena", &self.arena)
+            .field("nodes", &self.nodes)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 struct Scratch<B: Backend> {
     checked: FxHashSet<Coord>,
-    coords_buf: Vec<Coord>,
-    batch: Batch<'static, B::Buffer>,
+    vacant_buf: Vec<(Coord, Links)>,
+    jobs: StepScratch<HandleOf<B>>,
     alive_dsts: Vec<OwnedOf<B>>,
     dead_dsts: Vec<OwnedOf<B>>,
     results_buf: Vec<B::Activity>,
@@ -273,11 +329,11 @@ impl<B: Backend> Default for Scratch<B> {
     fn default() -> Self {
         Self {
             checked: FxHashSet::default(),
-            coords_buf: Vec::default(),
-            batch: Batch::default(),
-            alive_dsts: Vec::default(),
-            dead_dsts: Vec::default(),
-            results_buf: Vec::default(),
+            vacant_buf: Vec::default(),
+            jobs: StepScratch::new(),
+            alive_dsts: Vec::new(),
+            dead_dsts: Vec::new(),
+            results_buf: Vec::new(),
         }
     }
 }
@@ -310,11 +366,11 @@ impl<B: Backend> InfiniteFlatWorld<B> {
 
     /// Inserts or overwrites the chunk at chunk coordinates `coord`, marking all borders active.
     #[inline]
-    pub fn insert_chunk(&mut self, coord: Coord, chunk: &B::Chunk) {
+    pub fn insert_chunk(&mut self, coord: Coord, chunk: &Chunk) {
         if let Some(&node_id) = self.raw.index.get(&coord) {
             let node = &mut self.raw.nodes[node_id];
             // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
-            unsafe { self.raw.arena.store(&mut node.chunk, chunk) };
+            unsafe { self.raw.arena.store(node.chunk.borrow_mut(), chunk) };
             node.activity = Activity::ALL;
         } else {
             let chunk = self.raw.arena.own(chunk);
@@ -324,29 +380,26 @@ impl<B: Backend> InfiniteFlatWorld<B> {
 
     /// Returns a host copy of the chunk at `coord`, or `None` if that chunk is currently inactive.
     #[inline]
-    pub fn load_chunk(&self, coord: Coord) -> Option<B::Chunk> {
+    pub fn load_chunk(&self, coord: Coord) -> Option<Chunk> {
         Some(
             // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
             unsafe {
                 self.raw
                     .arena
-                    .load(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.id())
+                    .load(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.borrow())
             },
         )
     }
 
     /// Copies the chunk at `coord` into `dst`, returning `None` if that chunk is inactive.
     #[inline]
-    pub fn load_chunk_to<'a>(
-        &self,
-        coord: Coord,
-        dst: &'a mut B::Chunk,
-    ) -> Option<&'a mut B::Chunk> {
+    pub fn load_chunk_to<'a>(&self, coord: Coord, dst: &'a mut Chunk) -> Option<&'a mut Chunk> {
         // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
         unsafe {
-            self.raw
-                .arena
-                .load_to(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.id(), dst);
+            self.raw.arena.load_to(
+                self.raw.nodes[*self.raw.index.get(&coord)?].chunk.borrow(),
+                dst,
+            );
         }
         Some(dst)
     }
@@ -381,7 +434,7 @@ impl<B: Backend> Clone for InfiniteFlatWorld<B> {
 
 impl<B: Backend> Default for InfiniteFlatWorld<B>
 where
-    ConfigOf<B>: Default,
+    BufferOf<B>: Default,
 {
     #[inline]
     fn default() -> Self {
@@ -392,24 +445,34 @@ where
     }
 }
 
-impl<'a, B: Backend> Extend<(Coord, &'a B::Chunk)> for InfiniteFlatWorld<B> {
+impl<'a, B: Backend> Extend<(Coord, &'a Chunk)> for InfiniteFlatWorld<B> {
     #[inline]
-    fn extend<I: IntoIterator<Item = (Coord, &'a B::Chunk)>>(&mut self, iter: I) {
+    fn extend<I: IntoIterator<Item = (Coord, &'a Chunk)>>(&mut self, iter: I) {
         for (coord, chunk) in iter {
             self.insert_chunk(coord, chunk);
         }
     }
 }
 
-impl<'a, B: Backend> FromIterator<(Coord, &'a B::Chunk)> for InfiniteFlatWorld<B>
+impl<'a, B: Backend> FromIterator<(Coord, &'a Chunk)> for InfiniteFlatWorld<B>
 where
-    ConfigOf<B>: Default,
+    BufferOf<B>: Default,
 {
     #[inline]
-    fn from_iter<I: IntoIterator<Item = (Coord, &'a B::Chunk)>>(iter: I) -> Self {
+    fn from_iter<I: IntoIterator<Item = (Coord, &'a Chunk)>>(iter: I) -> Self {
         let mut ret = InfiniteFlatWorld::default();
         ret.extend(iter);
         ret
+    }
+}
+
+impl<B: Backend> Debug for InfiniteFlatWorld<B>
+where
+    RawInfiniteFlatWorld<B>: Debug,
+{
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.raw, f)
     }
 }
 
@@ -420,23 +483,22 @@ mod tests {
     use std::collections::HashSet;
 
     // Adjust imports as necessary for your module structure
-    use crate::backend::{SimdBackend, SimdChunk as NewChunk};
     use crate::infinite_flat_world::{Coord, InfiniteFlatWorld as NewWorld};
+    use crate::{Chunk as NewChunk, DefaultBackend};
 
     use crate::naive::chunk::NaiveChunk as OldChunk;
     use crate::naive::infinite_flat_world::InfiniteFlatWorld as OldWorld;
-    use crate::traits::Chunk;
 
     #[test]
     fn test_infinite_flat_world_topology_matches_naive() {
         let mut rng = StdRng::seed_from_u64(1337);
         let mut old_world = OldWorld::empty();
-        let mut new_world = NewWorld::<SimdBackend>::empty(());
+        let mut new_world = NewWorld::<DefaultBackend>::empty(());
 
         // 1. Seed a dense cluster of random chunks around the origin
         let seed_coords = [(0, 0), (1, 0), (0, 1), (-1, -1), (1, 1)];
         for &(cx, cy) in &seed_coords {
-            let new_chunk = NewChunk::from_bytes(&rng.random());
+            let new_chunk = Box::new(NewChunk::from_bytes(rng.random()));
             let old_chunk = OldChunk::from_bytes(new_chunk.to_bytes());
 
             new_world.insert_chunk(Coord { x: cx, y: cy }, &new_chunk);

@@ -1,4 +1,4 @@
-#![feature(portable_simd, vec_push_within_capacity, sync_unsafe_cell)]
+#![feature(portable_simd)]
 #![cfg_attr(
     all(target_arch = "s390x", target_feature = "vector-enhancements-2"),
     feature(stdarch_s390x)
@@ -14,13 +14,23 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::wildcard_imports,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    clippy::chunks_exact_to_as_chunks
 )]
-#![deny(clippy::missing_safety_doc, clippy::missing_inline_in_public_items)]
+#![warn(missing_debug_implementations, missing_copy_implementations)]
+#![deny(
+    clippy::missing_safety_doc,
+    clippy::missing_inline_in_public_items,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_safety_comment,
+    clippy::unnecessary_safety_doc
+)]
 
-pub mod arena;
+mod arena;
 pub mod backend;
-pub mod helpers;
+mod buffer;
+mod chunk;
+mod helpers;
 mod infinite_flat_world;
 mod primitives;
 mod toroidal_world;
@@ -28,12 +38,12 @@ mod traits;
 
 pub use arena::Arena;
 pub use backend::DefaultBackend;
+pub use buffer::*;
+pub use chunk::*;
 pub use infinite_flat_world::InfiniteFlatWorld;
 pub use primitives::*;
 pub use toroidal_world::ToroidalWorld;
 pub use traits::*;
-
-pub type DefaultChunk = ChunkOf<DefaultBackend>;
 
 #[allow(unused)]
 #[cfg(test)]

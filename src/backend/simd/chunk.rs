@@ -1,16 +1,16 @@
-use std::fmt::{self, Debug};
-use std::mem;
-use std::ops::BitOr;
-use std::str::FromStr;
+use std::fmt::Debug;
+use std::iter::zip;
 
-use crate::{Activity, Chunk, Dir, NeighborData, Orth, helpers};
+use crate::{Activity, Chunk, Dir, NeighborData, Orth};
 
 use super::row::*;
 
 const SIZE: usize = ROW_BITS;
 
+const _: () = assert!(ROW_BITS == Chunk::SIZE);
+
 #[derive(Clone, PartialEq, Eq)]
-pub struct SimdChunk {
+pub(super) struct SimdChunk {
     data: [Row; ROW_BITS],
 }
 
@@ -21,85 +21,24 @@ impl SimdChunk {
     }
 }
 
-impl Chunk for SimdChunk {
-    const SIZE: usize = ROW_BITS;
-
-    type Bytes = [u8; ROW_BYTES * ROW_BITS];
-
+impl SimdChunk {
     #[inline]
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self::new([empty_row(); _])
     }
 
-    #[inline]
-    fn from_bytes(bytes: &[u8; ROW_BYTES * ROW_BITS]) -> Self {
-        Self::from(*bytes)
-    }
-
-    #[inline]
-    fn to_bytes(&self) -> [u8; ROW_BYTES * ROW_BITS] {
-        self.clone().into()
-    }
-
-    #[inline]
-    fn num_alive(&self) -> usize {
-        self.data.iter().copied().map(row_num_alive).sum()
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        for block in self.data.as_chunks::<16>().0 {
-            // SAFETY: Each chunk from `as_chunks::<16>()` has length 16, so the iterator is non-empty.
-            let acc = unsafe { block.iter().copied().reduce(Row::bitor).unwrap_unchecked() };
-            if acc != empty_row() {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-impl Default for SimdChunk {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            data: [empty_row(); _],
+    pub(super) fn convert_into(&self, dst: &mut Chunk) {
+        for (src, dst) in zip(self.data, dst.as_rows_mut()) {
+            *dst = row_to_bytes(src);
         }
     }
 }
 
-impl From<[u8; ROW_BYTES * ROW_BITS]> for SimdChunk {
-    #[inline]
-    fn from(value: [u8; ROW_BYTES * ROW_BITS]) -> Self {
-        // SAFETY: `[u8; ROW_BYTES * ROW_BITS]` and `[[u8; ROW_BYTES]; ROW_BITS]` have identical
-        // size, alignment (1), and bit validity.
-        let bytes: [[u8; ROW_BYTES]; ROW_BITS] = unsafe { mem::transmute(value) };
-        Self::new(bytes.map(row_from_bytes))
-    }
-}
-
-impl From<SimdChunk> for [u8; ROW_BYTES * ROW_BITS] {
-    #[inline]
-    fn from(value: SimdChunk) -> Self {
-        // SAFETY: `[[u8; ROW_BYTES]; ROW_BITS]` and `[u8; ROW_BYTES * ROW_BITS]` have identical
-        // size, alignment (1), and bit validity.
-        unsafe { mem::transmute(value.data.map(row_to_bytes)) }
-    }
-}
-
-impl Debug for SimdChunk {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        helpers::print_chunk(f, self)
-    }
-}
-
-impl FromStr for SimdChunk {
-    type Err = helpers::ParseError;
-
-    #[inline]
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        helpers::parse_chunk(s)
+impl Chunk {
+    pub(super) fn convert_into(&self, dst: &mut SimdChunk) {
+        for (src, dst) in zip(self.as_rows(), &mut dst.data) {
+            *dst = row_from_bytes(*src);
+        }
     }
 }
 

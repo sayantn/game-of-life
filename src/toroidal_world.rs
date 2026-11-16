@@ -1,12 +1,13 @@
+use std::fmt::Debug;
 use std::iter::{FusedIterator, zip};
 use std::mem;
 
 use rand::Rng;
-use rand::distr::{Distribution, StandardUniform};
 
+use crate::helpers::push_within_capacity;
 use crate::{
-    Backend, Batch, Buffer, BufferOf, BytesOf, Chunk, ChunkOf, ConfigOf, DefaultBackend,
-    NeighborData, Owned, OwnedOf,
+    Backend, Buffer, BufferOf, Chunk, ComputeJob, ConfigOf, DefaultBackend, HandleOf, NeighborData,
+    OwnedOf, StepScratch,
 };
 
 /// Fixed-size, wrap-around (toroidal) Game of Life simulation grid backed by [`Backend`] `B`.
@@ -18,8 +19,7 @@ pub struct ToroidalWorld<B: Backend = DefaultBackend> {
     chunks: Box<[OwnedOf<B>]>,
     alternate: Box<[OwnedOf<B>]>,
     topology: Box<[NeighborData<usize>]>,
-
-    batch: Batch<'static, B::Buffer>,
+    jobs: StepScratch<HandleOf<B>>,
     v_chunks: usize,
     h_chunks: usize,
 }
@@ -32,7 +32,7 @@ impl<B: Backend> ToroidalWorld<B> {
         config: ConfigOf<B>,
         h_chunks: usize,
         v_chunks: usize,
-        mut f: impl FnMut(usize, usize) -> B::Chunk,
+        mut f: impl FnMut(usize, usize) -> Chunk,
     ) -> Self {
         let total_chunks = v_chunks * h_chunks;
 
@@ -60,20 +60,20 @@ impl<B: Backend> ToroidalWorld<B> {
 
         let alternate = chunks.split_off(total_chunks);
 
-        let chunk_values: Vec<_> = (0..v_chunks)
+        for ((i, j), dst) in (0..v_chunks)
             .flat_map(|i| (0..h_chunks).map(move |j| (i, j)))
-            .map(|(i, j)| f(j, i))
-            .collect();
-
-        // SAFETY: Every handle in `chunks` was just minted by `buffer.grow_exact`.
-        unsafe { buffer.store_batched(&mut chunks, &chunk_values) };
+            .zip(&mut chunks)
+        {
+            // SAFETY: `dst` was just minted by `buffer.grow_exact`.
+            unsafe { buffer.store(dst.borrow_mut(), &f(i, j)) };
+        }
 
         Self {
             buffer,
             chunks: chunks.into_boxed_slice(),
             alternate: alternate.into_boxed_slice(),
             topology,
-            batch: Batch::new(),
+            jobs: StepScratch::new(),
             v_chunks,
             h_chunks,
         }
@@ -81,11 +81,15 @@ impl<B: Backend> ToroidalWorld<B> {
 
     /// Constructs a `h_chunks × v_chunks` toroidal world filled with uniformly random cells.
     #[inline]
-    pub fn random(config: ConfigOf<B>, h_chunks: usize, v_chunks: usize, rng: &mut impl Rng) -> Self
-    where
-        StandardUniform: Distribution<BytesOf<B>>,
-    {
-        Self::from_fn(config, h_chunks, v_chunks, |_, _| B::Chunk::random(rng))
+    pub fn random(
+        config: ConfigOf<B>,
+        h_chunks: usize,
+        v_chunks: usize,
+        rng: &mut impl Rng,
+    ) -> Self {
+        Self::from_fn(config, h_chunks, v_chunks, |_, _| {
+            Chunk::from_bytes(rng.random())
+        })
     }
 
     /// Constructs a `h_chunks × v_chunks` toroidal world with all cells initially dead.
@@ -107,48 +111,54 @@ impl<B: Backend> ToroidalWorld<B> {
     /// Returns the total number of cells across all chunks (`h_chunks * v_chunks * SIZE²`).
     #[inline]
     pub fn num_cells(&self) -> usize {
-        self.chunks.len() * ChunkOf::<B>::SIZE * ChunkOf::<B>::SIZE
+        self.chunks.len() * Chunk::SIZE * Chunk::SIZE
     }
 
     /// Returns the total number of live cells currently in the world.
     #[inline]
-    pub fn num_alive(&self) -> usize {
-        self.chunks_iter().map(|chunk| chunk.num_alive()).sum()
+    pub fn population(&self) -> u32 {
+        self.chunks_iter().map(|chunk| chunk.population()).sum()
     }
 
     /// Iterates over all chunks in row-major order, downloading each chunk from the backend.
     #[inline]
     pub fn chunks_iter(
         &self,
-    ) -> impl ExactSizeIterator<Item = B::Chunk> + DoubleEndedIterator + FusedIterator {
+    ) -> impl ExactSizeIterator<Item = Chunk> + DoubleEndedIterator + FusedIterator {
         self.chunks.iter().map(|chunk| {
             // SAFETY: Every `Owned` handle in `self.chunks` was minted by `self.buffer`.
-            unsafe { self.buffer.load(chunk.id()) }
+            unsafe { self.buffer.load(chunk.borrow()) }
         })
     }
 
     /// Advances the entire toroidal grid by one generation.
     #[inline]
     pub fn clock(&mut self) {
-        let mut batch = mem::take(&mut self.batch).recycle();
+        let mut jobs = self.jobs.start_tick();
 
-        batch.reserve_alive(self.chunks.len());
-        for (chunk, links) in self.chunks.iter().zip(&self.topology) {
-            let nbhd = links.map(|idx| {
+        jobs.compute.reserve(self.chunks.len());
+        for ((chunk, links), dst) in zip(&self.chunks, &self.topology).zip(&mut self.alternate) {
+            let neighbors = links.map(|idx| {
                 // SAFETY: `self.topology` only contains indices in `0..self.chunks.len()`.
-                unsafe { self.chunks.get_unchecked(idx).id() }
+                unsafe { self.chunks.get_unchecked(idx).borrow() }
             });
-            batch.push_alive_within_capacity(chunk.id(), nbhd);
+            push_within_capacity(
+                &mut jobs.compute,
+                ComputeJob {
+                    neighbors,
+                    center: chunk.borrow(),
+                    dst: dst.borrow_mut(),
+                },
+            );
         }
 
         // SAFETY: All IDs in `batch` come from `self.chunks` and all destination handles in
         // `self.alternate` are disjoint `Owned` tokens minted by `self.buffer`.
         unsafe {
-            self.buffer
-                .step_batched(&batch, &mut self.alternate, &mut []);
+            self.buffer.step_batched(&mut jobs, None);
         }
 
-        self.batch = batch.recycle();
+        self.jobs.finish_tick(jobs);
 
         mem::swap(&mut self.chunks, &mut self.alternate);
     }
@@ -165,7 +175,7 @@ impl<B: Backend> Clone for ToroidalWorld<B> {
 
         for (dst, src) in zip(&mut new_chunks, &self.chunks) {
             // SAFETY: `dst` was minted by `new_buffer` and `src` was minted by `self.buffer`.
-            unsafe { new_buffer.copy(dst, &self.buffer, src.id()) };
+            unsafe { new_buffer.copy(dst.borrow_mut(), &self.buffer, src.borrow()) };
         }
 
         Self {
@@ -173,7 +183,7 @@ impl<B: Backend> Clone for ToroidalWorld<B> {
             chunks: new_chunks.into_boxed_slice(),
             alternate: alternate.into_boxed_slice(),
             topology: self.topology.clone(),
-            batch: Batch::default(),
+            jobs: StepScratch::new(),
             v_chunks: self.v_chunks,
             h_chunks: self.h_chunks,
         }
@@ -186,8 +196,27 @@ impl<B: Backend> Clone for ToroidalWorld<B> {
 
         for (dst, src) in zip(&mut self.chunks, &source.chunks) {
             // SAFETY: `dst` was minted by `self.buffer` and `src` was minted by `source.buffer`.
-            unsafe { self.buffer.copy(dst, &source.buffer, src.id()) };
+            unsafe {
+                self.buffer
+                    .copy(dst.borrow_mut(), &source.buffer, src.borrow());
+            }
         }
+    }
+}
+
+impl<B: Backend> Debug for ToroidalWorld<B>
+where
+    BufferOf<B>: Debug,
+    OwnedOf<B>: Debug,
+{
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToroidalWorld")
+            .field("buffer", &self.buffer)
+            .field("chunks", &self.chunks)
+            .field("v_chunks", &self.v_chunks)
+            .field("h_chunks", &self.h_chunks)
+            .finish()
     }
 }
 

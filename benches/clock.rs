@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use game_of_life::{Chunk, Coord, DefaultBackend, DefaultChunk, InfiniteFlatWorld, ToroidalWorld};
+use game_of_life::{Chunk, Coord, DefaultBackend, InfiniteFlatWorld, ToroidalWorld};
+use rand::Rng;
 use rand::{SeedableRng, rngs::StdRng};
 
 /// Generations per Criterion iteration. Set with `GOL_GENS=...`.
@@ -48,7 +49,7 @@ fn clock(c: &mut Criterion) {
             "side {side}: {} generations executed, {} cells, alive at end {}",
             GENS_RUN.load(Ordering::Relaxed),
             cells,
-            world.num_alive(),
+            world.population(),
         );
     }
 
@@ -66,7 +67,7 @@ fn infinite_clock(c: &mut Criterion) {
         // Seed a dense block of chunks
         for y in 0..side {
             for x in 0..side {
-                initial_world.insert_chunk(Coord { x, y }, &Chunk::random(&mut rng));
+                initial_world.insert_chunk(Coord { x, y }, &Chunk::from_bytes(rng.random()));
             }
         }
 
@@ -82,7 +83,7 @@ fn infinite_clock(c: &mut Criterion) {
             total_empty_evals += empty;
         }
 
-        let cells_per_chunk = (DefaultChunk::SIZE * DefaultChunk::SIZE) as u64;
+        let cells_per_chunk = (Chunk::SIZE * Chunk::SIZE) as u64;
         let total_chunks = (total_active_evals + total_empty_evals) as u64;
         let exact_cells_per_run = total_chunks * cells_per_chunk;
 
@@ -142,7 +143,7 @@ fn infinite_clock_sparse(c: &mut Criterion) {
                         x: x * 10,
                         y: y * 10,
                     },
-                    &Chunk::random(&mut rng),
+                    &Chunk::from_bytes(rng.random()),
                 );
             }
         }
@@ -157,7 +158,7 @@ fn infinite_clock_sparse(c: &mut Criterion) {
             total_empty_evals += empty;
         }
 
-        let cells_per_chunk = (DefaultChunk::SIZE * DefaultChunk::SIZE) as u64;
+        let cells_per_chunk = (Chunk::SIZE * Chunk::SIZE) as u64;
         let exact_cells_per_run = (total_active_evals + total_empty_evals) as u64 * cells_per_chunk;
 
         group.throughput(Throughput::Elements(exact_cells_per_run));

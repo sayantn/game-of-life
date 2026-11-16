@@ -1,64 +1,61 @@
-use std::cell::SyncUnsafeCell;
-use std::marker::PhantomData;
+use std::cell::UnsafeCell;
 
 mod chunk;
 mod row;
 
 pub use chunk::SimdActivity;
-pub use chunk::SimdChunk;
+use chunk::SimdChunk;
 
-use crate::{Backend, Batch, Buffer, Chunk, Owned};
+use crate::{
+    Backend, Borrowed, BorrowedMut, Buffer, Chunk, ComputeJob, Owned, TickBatch, VacantComputeJob,
+};
 
 /// Single-node, AVX2-accelerated CPU compute backend.
+#[derive(Debug, Clone, Copy)]
 pub struct SimdBackend;
 
 impl Backend for SimdBackend {
-    type Chunk = SimdChunk;
     type Buffer = SimdBuffer;
     type Activity = SimdActivity;
 }
 
-/// Exclusive ownership handle for a single slot in [`SimdBuffer`].
-///
-/// Intentionally does not implement `Clone` or `Copy`.
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct SimdOwned(usize);
-
-impl Owned for SimdOwned {
-    type Id<'a> = SimdId<'a>;
-
-    #[inline]
-    fn id(&self) -> Self::Id<'_> {
-        SimdId(self.0, PhantomData)
-    }
-}
-
-/// Lightweight, `Copy` read-only capability handle borrowing a slot in [`SimdBuffer`]
-/// for lifetime `'a`.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct SimdId<'a>(usize, PhantomData<&'a SimdOwned>);
+pub type SimdHandle = usize;
 
 /// Host-memory slab backing [`SimdBackend`], storing chunks in contiguous `SyncUnsafeCell`s
 /// for lock-free parallel reads and disjoint writes.
+#[derive(Debug)]
 pub struct SimdBuffer {
-    chunks: Vec<SyncUnsafeCell<SimdChunk>>,
+    chunks: Vec<UnsafeCell<SimdChunk>>,
 }
 
+unsafe impl Sync for SimdBuffer {}
+
 impl SimdBuffer {
+    /// Retrieves a shared reference to the chunk at the given handle index.
+    ///
+    /// # Safety
+    /// - `id` must have been minted by this exact `SimdBuffer` instance.
+    /// - The caller must ensure that no exclusive (`&mut`) reference to the slot
+    ///   exists for the duration of the returned lifetime.
     #[inline]
-    unsafe fn get<'a>(&'a self, id: SimdId<'a>) -> &'a SimdChunk {
+    unsafe fn get(&self, id: SimdHandle) -> &SimdChunk {
         // SAFETY: Caller guarantees `id` was minted by `self` (so `id.0 < self.chunks.len()`)
-        // and no mutable reference to slot `id.0` exists while `id` is live.
-        unsafe { &*self.chunks.get_unchecked(id.0).get() }
+        // and no mutable reference to slot `id` exists while `id` is live.
+        unsafe { self.chunks.get_unchecked(id).as_ref_unchecked() }
     }
 
+    /// Retrieves an exclusive reference to the chunk at the given handle index.
+    ///
+    /// # Safety
+    /// - `id` must have been minted by this exact `SimdBuffer` instance.
+    /// - The caller must ensure exclusive access to the slot; no other references
+    ///   (shared or exclusive) to this slot may exist for the duration of the returned lifetime.
     #[inline]
-    unsafe fn get_mut<'a>(&'a self, owned: &'a mut SimdOwned) -> &'a mut SimdChunk {
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self, id: SimdHandle) -> &mut SimdChunk {
         // SAFETY: Caller guarantees `owned` was minted by `self` (so `owned.0 < self.chunks.len()`)
         // and `&mut SimdOwned` guarantees exclusive access to slot `owned.0`.
-        unsafe { &mut *self.chunks.get_unchecked(owned.0).get() }
+        unsafe { self.chunks.get_unchecked(id).as_mut_unchecked() }
     }
 }
 
@@ -71,10 +68,8 @@ impl Default for SimdBuffer {
 
 unsafe impl Buffer for SimdBuffer {
     type Config = ();
-    type Chunk = SimdChunk;
     type Activity = SimdActivity;
-    type Owned = SimdOwned;
-    type Id<'a> = SimdId<'a>;
+    type Handle = SimdHandle;
 
     #[inline]
     fn new((): Self::Config) -> Self {
@@ -92,7 +87,7 @@ unsafe impl Buffer for SimdBuffer {
     }
 
     #[inline]
-    fn grow(&mut self, additional: usize, out: &mut Vec<Self::Owned>) {
+    fn grow(&mut self, additional: usize, out: &mut Vec<Owned<SimdHandle>>) {
         if additional == 0 {
             return;
         }
@@ -103,15 +98,18 @@ unsafe impl Buffer for SimdBuffer {
         let new_cap = self.chunks.capacity();
 
         self.chunks
-            .resize_with(new_cap, || SyncUnsafeCell::new(SimdChunk::empty()));
+            .resize_with(new_cap, || UnsafeCell::new(SimdChunk::empty()));
 
         // Push in reverse so `Vec::pop` hands out sequential indices `old_cap..new_cap`.
         out.reserve(new_cap - old_cap);
-        out.extend((old_cap..new_cap).rev().map(SimdOwned));
+        out.extend((old_cap..new_cap).rev().map(|raw| {
+            // SAFETY: `raw` monotonically increases, so the same handle is never minted twice
+            unsafe { Owned::from_raw(raw) }
+        }));
     }
 
     #[inline]
-    fn grow_exact(&mut self, additional: usize, out: &mut Vec<Self::Owned>) {
+    fn grow_exact(&mut self, additional: usize, out: &mut Vec<Owned<SimdHandle>>) {
         if additional == 0 {
             return;
         }
@@ -121,121 +119,48 @@ unsafe impl Buffer for SimdBuffer {
         let new_cap = self.chunks.capacity();
 
         self.chunks
-            .resize_with(new_cap, || SyncUnsafeCell::new(SimdChunk::empty()));
+            .resize_with(new_cap, || UnsafeCell::new(SimdChunk::empty()));
 
         // Push in reverse so `Vec::pop` hands out sequential indices `old_cap..new_cap`.
         out.reserve(new_cap - old_cap);
-        out.extend((old_cap..new_cap).rev().map(SimdOwned));
+        out.extend((old_cap..new_cap).rev().map(|raw| {
+            // SAFETY: `raw` monotonically increases, so the same handle is never minted twice
+            unsafe { Owned::from_raw(raw) }
+        }));
     }
 
     #[inline]
-    unsafe fn load_to(&self, id: Self::Id<'_>, dst: &mut Self::Chunk) {
+    unsafe fn load_to(&self, id: Borrowed<'_, SimdHandle>, dst: &mut Chunk) {
         // SAFETY: Caller guarantees `id` was minted by `self`.
-        unsafe { self.get(id).clone_into(dst) };
+        unsafe { self.get(id.raw()).convert_into(dst) };
     }
 
     #[inline]
-    unsafe fn store(&self, dst: &mut Self::Owned, src: &Self::Chunk) {
+    unsafe fn store(&self, dst: BorrowedMut<'_, SimdHandle>, src: &Chunk) {
         // SAFETY: Caller guarantees `dst` was minted by `self`.
-        unsafe { src.clone_into(self.get_mut(dst)) };
+        unsafe { src.convert_into(self.get_mut(dst.raw())) };
     }
 
     #[inline]
-    unsafe fn copy(&self, dst: &mut Self::Owned, from: &Self, src: Self::Id<'_>) {
-        // SAFETY: Caller guarantees `dst` was minted by `self` and `src` was minted by `from`.
-        unsafe { from.get(src).clone_into(self.get_mut(dst)) };
-    }
-
-    #[inline]
-    unsafe fn compute_batched(
+    unsafe fn copy(
         &self,
-        batch: &Batch<'_, Self>,
-        alive_dsts: &mut [Self::Owned],
-        dead_dsts: &mut [Self::Owned],
-        out: &mut Vec<SimdActivity>,
+        dst: BorrowedMut<'_, SimdHandle>,
+        from: &Self,
+        src: Borrowed<'_, SimdHandle>,
     ) {
-        assert_eq!(alive_dsts.len(), batch.alive_len());
-        assert_eq!(dead_dsts.len(), batch.dead_len());
-
-        let total_len = alive_dsts.len() + dead_dsts.len();
-
-        // SAFETY: Caller guarantees all source/neighbor IDs and destination `Owned` handles were
-        // minted by `self`, and the capability rules ensure no destination slot aliases any input
-        // or other destination slot.
-
-        if cfg!(feature = "parallel") && total_len >= 32 {
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-
-                let alive_results = batch
-                    .alive_srcs()
-                    .par_iter()
-                    .zip(batch.alive_nbhds())
-                    .zip(alive_dsts)
-                    .map(|((&src, &neighbors), dst)| unsafe {
-                        chunk::apply_rules(
-                            self.get(src),
-                            neighbors.map(|idx| self.get(idx)),
-                            self.get_mut(dst),
-                        )
-                    });
-
-                let dead_results =
-                    batch
-                        .dead_nbhds()
-                        .par_iter()
-                        .zip(dead_dsts)
-                        .map(|(&neighbors, dst)| unsafe {
-                            chunk::check_activity(
-                                neighbors.map(|idx| self.get(idx)),
-                                self.get_mut(dst),
-                            )
-                        });
-
-                alive_results.chain(dead_results).collect_into_vec(out);
-            }
-        } else {
-            out.clear();
-
-            out.extend(
-                batch
-                    .alive_srcs()
-                    .iter()
-                    .zip(batch.alive_nbhds())
-                    .zip(alive_dsts)
-                    .map(|((&src, &neighbors), dst)| unsafe {
-                        chunk::apply_rules(
-                            self.get(src),
-                            neighbors.map(|idx| self.get(idx)),
-                            self.get_mut(dst),
-                        )
-                    }),
-            );
-
-            out.extend(
-                batch
-                    .dead_nbhds()
-                    .iter()
-                    .zip(dead_dsts)
-                    .map(|(&neighbors, dst)| unsafe {
-                        chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst))
-                    }),
-            );
-        }
+        // SAFETY: Caller guarantees `dst` was minted by `self` and `src` was minted by `from`.
+        unsafe { from.get(src.raw()).clone_into(self.get_mut(dst.raw())) };
     }
 
     #[inline]
     unsafe fn step_batched(
         &self,
-        batch: &Batch<'_, Self>,
-        alive_dsts: &mut [Self::Owned],
-        dead_dsts: &mut [Self::Owned],
+        jobs: &mut TickBatch<'_, SimdHandle>,
+        activities: Option<&mut Vec<SimdActivity>>,
     ) {
-        assert_eq!(alive_dsts.len(), batch.alive_len());
-        assert_eq!(dead_dsts.len(), batch.dead_len());
+        #![allow(clippy::undocumented_unsafe_blocks, clippy::unnecessary_safety_comment)]
 
-        let total_len = alive_dsts.len() + dead_dsts.len();
+        let total_len = jobs.compute.len() + jobs.vacant_compute.len();
 
         // SAFETY: Caller guarantees all source/neighbor IDs and destination `Owned` handles were
         // minted by `self`, and the capability rules ensure no destination slot aliases any input
@@ -246,54 +171,65 @@ unsafe impl Buffer for SimdBuffer {
             {
                 use rayon::prelude::*;
 
-                let alive_results = batch
-                    .alive_srcs()
-                    .par_iter()
-                    .zip(batch.alive_nbhds())
-                    .zip(alive_dsts)
-                    .map(|((&src, &neighbors), dst)| unsafe {
+                let alive_results = jobs.compute.par_iter_mut().map(
+                    |ComputeJob {
+                         center,
+                         neighbors,
+                         dst,
+                     }| unsafe {
                         chunk::apply_rules(
-                            self.get(src),
-                            neighbors.map(|idx| self.get(idx)),
-                            self.get_mut(dst),
-                        );
-                    });
+                            self.get(center.raw()),
+                            neighbors.map(|idx| self.get(idx.raw())),
+                            self.get_mut(dst.raw()),
+                        )
+                    },
+                );
 
-                let dead_results =
-                    batch
-                        .dead_nbhds()
-                        .par_iter()
-                        .zip(dead_dsts)
-                        .map(|(&neighbors, dst)| unsafe {
-                            chunk::check_activity(
-                                neighbors.map(|idx| self.get(idx)),
-                                self.get_mut(dst),
-                            );
-                        });
+                let dead_results = jobs.vacant_compute.par_iter_mut().map(
+                    |VacantComputeJob { neighbors, dst }| unsafe {
+                        chunk::check_activity(
+                            neighbors.map(|idx| self.get(idx.raw())),
+                            self.get_mut(dst.raw()),
+                        )
+                    },
+                );
 
-                alive_results.chain(dead_results).for_each(drop);
+                if let Some(output) = activities {
+                    output.par_extend(alive_results.chain(dead_results));
+                } else {
+                    alive_results.chain(dead_results).for_each(drop);
+                }
             }
         } else {
-            batch
-                .alive_srcs()
-                .iter()
-                .zip(batch.alive_nbhds())
-                .zip(alive_dsts)
-                .for_each(|((&src, &neighbors), dst)| unsafe {
+            let alive_results = jobs.compute.iter_mut().map(
+                |ComputeJob {
+                     center,
+                     neighbors,
+                     dst,
+                 }| unsafe {
                     chunk::apply_rules(
-                        self.get(src),
-                        neighbors.map(|idx| self.get(idx)),
-                        self.get_mut(dst),
-                    );
-                });
+                        self.get(center.raw()),
+                        neighbors.map(|idx| self.get(idx.raw())),
+                        self.get_mut(dst.raw()),
+                    )
+                },
+            );
 
-            batch
-                .dead_nbhds()
-                .iter()
-                .zip(dead_dsts)
-                .for_each(|(&neighbors, dst)| unsafe {
-                    chunk::check_activity(neighbors.map(|idx| self.get(idx)), self.get_mut(dst));
-                });
+            let dead_results =
+                jobs.vacant_compute
+                    .iter_mut()
+                    .map(|VacantComputeJob { neighbors, dst }| unsafe {
+                        chunk::check_activity(
+                            neighbors.map(|idx| self.get(idx.raw())),
+                            self.get_mut(dst.raw()),
+                        )
+                    });
+
+            if let Some(output) = activities {
+                output.extend(alive_results.chain(dead_results));
+            } else {
+                alive_results.chain(dead_results).for_each(drop);
+            }
         }
     }
 }

@@ -126,7 +126,7 @@ cfg_select! {
             target_feature = "lsx"
         )
     ) => {
-        use std::simd::{num::SimdUint, *};
+        use std::simd::*;
 
         pub(crate) const NUM_LANES: usize = Row::LEN;
 
@@ -143,11 +143,6 @@ cfg_select! {
         #[inline]
         pub(crate) fn row_to_bytes(row: Row) -> [u8; ROW_BYTES] {
             row.to_be_bytes().to_array()
-        }
-
-        #[inline]
-        pub(crate) fn row_num_alive(row: Row) -> usize {
-            row.count_ones().reduce_sum() as _
         }
 
         #[inline]
@@ -270,11 +265,6 @@ cfg_select! {
         #[inline]
         pub(crate) fn row_to_bytes(row: Row) -> [u8; ROW_BYTES] {
             row.to_be_bytes()
-        }
-
-        #[inline]
-        pub(crate) fn row_num_alive(row: Row) -> usize {
-            row.count_ones() as _
         }
 
         #[inline]
