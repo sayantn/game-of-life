@@ -131,7 +131,7 @@ cfg_select! {
         pub(crate) const NUM_LANES: usize = Row::LEN;
 
         #[inline]
-        pub(crate) fn empty_row() -> Row {
+        pub(crate) const fn empty_row() -> Row {
             Simd::splat(0)
         }
 
@@ -235,14 +235,14 @@ cfg_select! {
                 fn shld1(a: Row, b: Row) -> Row {
                     let carry_lanes = a.shift_elements_left::<1>(0)
                         | b.shift_elements_right::<{ Row::LEN - 1 }>(0);
-                    (a << Simd::splat(1)) | (carry_lanes >> Simd::splat(63))
+                    (a << Simd::splat(1)) | (carry_lanes >> Simd::splat(LANE_BITS as Lane - 1))
                 }
 
                 #[inline]
                 fn shrd1(a: Row, b: Row) -> Row {
                     let carry_lanes = b.shift_elements_right::<1>(0)
                         | a.shift_elements_left::<{ Row::LEN - 1 }>(0);
-                    (b >> Simd::splat(1)) | (carry_lanes << Simd::splat(63))
+                    (b >> Simd::splat(1)) | (carry_lanes << Simd::splat(LANE_BITS as Lane - 1))
                 }
             }
         }
@@ -253,32 +253,32 @@ cfg_select! {
         pub(crate) type Lane = u64;
 
         #[inline]
-        pub(crate) fn empty_row() -> Row {
+        pub(crate) const fn empty_row() -> Row {
             0
         }
 
         #[inline]
-        pub(crate) fn row_from_bytes(bytes: [u8; ROW_BYTES]) -> Row {
+        pub(crate) const fn row_from_bytes(bytes: [u8; ROW_BYTES]) -> Row {
             Row::from_be_bytes(bytes)
         }
 
         #[inline]
-        pub(crate) fn row_to_bytes(row: Row) -> [u8; ROW_BYTES] {
+        pub(crate) const fn row_to_bytes(row: Row) -> [u8; ROW_BYTES] {
             row.to_be_bytes()
         }
 
         #[inline]
-        pub(crate) fn edge_cols(row: Row) -> Lane {
+        pub(crate) const fn edge_cols(row: Row) -> Lane {
             (row & (1 << (LANE_BITS - 1))) | (row & 1)
         }
 
         #[inline]
-        fn shld1(a: Row, b: Row) -> Row {
+        const fn shld1(a: Row, b: Row) -> Row {
             a.funnel_shl(b, 1)
         }
 
         #[inline]
-        fn shrd1(a: Row, b: Row) -> Row {
+        const fn shrd1(a: Row, b: Row) -> Row {
             a.funnel_shr(b, 1)
         }
     }

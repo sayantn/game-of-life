@@ -14,16 +14,23 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::wildcard_imports,
-    clippy::doc_markdown,
     clippy::chunks_exact_to_as_chunks
 )]
-#![warn(missing_debug_implementations, missing_copy_implementations)]
+#![warn(
+    missing_debug_implementations,
+    missing_copy_implementations,
+    clippy::ptr_as_ptr,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::missing_const_for_fn,
+    // missing_docs
+)]
 #![deny(
     clippy::missing_safety_doc,
     clippy::missing_inline_in_public_items,
     clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_safety_comment,
-    clippy::unnecessary_safety_doc
+    clippy::unnecessary_safety_doc,
+    unsafe_op_in_unsafe_fn
 )]
 
 mod arena;

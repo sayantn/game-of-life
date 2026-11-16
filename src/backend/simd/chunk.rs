@@ -16,14 +16,14 @@ pub(super) struct SimdChunk {
 
 impl SimdChunk {
     #[allow(clippy::large_types_passed_by_value)]
-    fn new(data: [Row; ROW_BITS]) -> Self {
+    const fn new(data: [Row; ROW_BITS]) -> Self {
         Self { data }
     }
 }
 
 impl SimdChunk {
     #[inline]
-    pub(super) fn empty() -> Self {
+    pub(super) const fn empty() -> Self {
         Self::new([empty_row(); _])
     }
 

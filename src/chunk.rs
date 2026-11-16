@@ -4,10 +4,10 @@ use crate::helpers::{ParseError, parse_chunk, print_chunk};
 
 /// Canonical, architecture-independent 256×256 Game of Life chunk.
 ///
-/// Serves as the universal data currency across all [`Buffer`](crate::traits::Buffer)
+/// Serves as the universal data currency across all [`Buffer`](crate::Buffer)
 /// backends (CPU scalar, SIMD, and GPU). Each backend converts between `Chunk`
-/// and its internal memory layout during [`load`](crate::traits::Buffer::load)
-/// and [`store`](crate::traits::Buffer::store).
+/// and its internal memory layout during [`load`](crate::Buffer::load)
+/// and [`store`](crate::Buffer::store).
 ///
 /// # Memory Layout
 /// - **Dimensions:** 256 rows (`y` in `0..256`) × 256 columns (`x` in `0..256`),

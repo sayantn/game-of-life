@@ -273,8 +273,8 @@ pub unsafe trait Buffer: 'static + Sized {
 #[must_use]
 #[derive(Debug)]
 pub struct StepScratch<D: Copy> {
-    compute: Vec<[D; 10]>,
-    vacant_compute: Vec<[D; 9]>,
+    compute: Vec<ComputeJob<'static, D>>,
+    vacant_compute: Vec<VacantComputeJob<'static, D>>,
 }
 
 impl<D: Copy> Default for StepScratch<D> {

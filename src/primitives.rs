@@ -15,7 +15,7 @@ impl Orth {
     pub const ALL: [Orth; 4] = [Orth::N, Orth::W, Orth::E, Orth::S];
 
     #[inline]
-    pub fn dir(self) -> Dir {
+    pub const fn dir(self) -> Dir {
         match self {
             Self::N => Dir::N,
             Self::W => Dir::W,
@@ -53,13 +53,13 @@ impl Dir {
     ];
 
     #[inline]
-    pub fn opposite(self) -> Dir {
+    pub const fn opposite(self) -> Dir {
         Dir::ALL[7 - self as usize]
     }
 
     #[inline]
     #[must_use]
-    pub fn offset(self) -> (i64, i64) {
+    pub const fn offset(self) -> (i64, i64) {
         match self {
             Dir::NW => (-1, 1),
             Dir::N => (0, 1),
@@ -76,7 +76,7 @@ impl Dir {
     /// to its corresponding compass direction.
     ///
     /// # Panics
-    /// Panics if the offset is `(0, 0)` or if `dx` or `dy` are outside the range `[-1, 1]`.#[inline]
+    /// Panics if the offset is `(0, 0)` or if `dx` or `dy` are outside the range `[-1, 1]`.
     #[inline]
     pub fn from_offset(dx: i64, dy: i64) -> Self {
         match (dx, dy) {
@@ -121,7 +121,7 @@ impl<T> NeighborData<T> {
     }
 
     #[inline]
-    pub fn as_ref(&self) -> NeighborData<&T> {
+    pub const fn as_ref(&self) -> NeighborData<&T> {
         NeighborData(self.0.each_ref())
     }
 
@@ -146,7 +146,7 @@ pub struct Coord {
 
 impl Coord {
     #[inline]
-    pub fn step(self, dir: Dir) -> Self {
+    pub const fn step(self, dir: Dir) -> Self {
         let (dx, dy) = dir.offset();
         Self {
             x: self.x + dx,

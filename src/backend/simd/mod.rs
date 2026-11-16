@@ -28,15 +28,30 @@ pub struct SimdBuffer {
     chunks: Vec<UnsafeCell<SimdChunk>>,
 }
 
+/// SAFETY:
+/// `SimdBuffer` exclusively owns its heap allocation (`Vec`). The underlying data
+/// (`SimdChunk`) consists purely of SIMD vector integers (Plain Old Data) and contains
+/// no thread-local state, raw pointers, or un-sendable types. Therefore, it is
+/// perfectly safe to transfer the entire buffer across thread boundaries.
+unsafe impl Send for SimdBuffer {}
+
+/// SAFETY:
+/// `SimdBuffer` utilizes interior mutability (e.g., `UnsafeCell` or raw pointers) to
+/// allow disjoint mutations across chunks. This is safe to share across threads (`Sync`)
+/// because the capability system (`Borrowed` and `BorrowedMut`) mathematically guarantees
+/// at compile time that no two threads can ever acquire overlapping mutable references,
+/// and no thread can read a chunk while another is writing to it. The capability tokens
+/// act as a zero-cost compile-time lock.
 unsafe impl Sync for SimdBuffer {}
 
 impl SimdBuffer {
     /// Retrieves a shared reference to the chunk at the given handle index.
     ///
     /// # Safety
-    /// - `id` must have been minted by this exact `SimdBuffer` instance.
-    /// - The caller must ensure that no exclusive (`&mut`) reference to the slot
-    ///   exists for the duration of the returned lifetime.
+    /// - `id` must have been minted by this exact `SimdBuffer`.
+    /// - The `Borrowed` capability token statically proves that no exclusive (`BorrowedMut`)
+    ///   token exists for this slot for the duration of `'a`. Therefore, no mutable aliasing
+    ///   or data races can occur while reading.
     #[inline]
     unsafe fn get(&self, id: SimdHandle) -> &SimdChunk {
         // SAFETY: Caller guarantees `id` was minted by `self` (so `id.0 < self.chunks.len()`)
@@ -44,12 +59,14 @@ impl SimdBuffer {
         unsafe { self.chunks.get_unchecked(id).as_ref_unchecked() }
     }
 
-    /// Retrieves an exclusive reference to the chunk at the given handle index.
+    /// Retrieves an exclusive mutable reference to the chunk at the given handle index.
     ///
     /// # Safety
-    /// - `id` must have been minted by this exact `SimdBuffer` instance.
-    /// - The caller must ensure exclusive access to the slot; no other references
-    ///   (shared or exclusive) to this slot may exist for the duration of the returned lifetime.
+    /// - `id` must have been minted by this exact `SimdBuffer`.
+    /// - The caller's possession of a `BorrowedMut` capability mathematically guarantees
+    ///   at the type level that no other tokens (shared or exclusive) exist for this
+    ///   specific slot. Therefore, mutating through the derived pointer is strictly
+    ///   disjoint and free of aliasing.
     #[inline]
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self, id: SimdHandle) -> &mut SimdChunk {
@@ -66,6 +83,17 @@ impl Default for SimdBuffer {
     }
 }
 
+/// SAFETY:
+/// - **Handle Exclusivity:** `grow` and `grow_exact` increase the capacity of the backing
+///   storage and mint fresh, unique `Owned` capability tokens strictly for the newly allocated
+///   range `old_cap..new_cap`. Existing handles are never duplicated.
+/// - **Stability Across Reallocation:** Capability tokens wrap a purely logical `usize` index.
+///   When the backing storage resizes and moves on the heap, the raw pointers change, but the
+///   logical indices within the capability tokens remain universally valid.
+/// - **Interior Mutability & Data Races:** The capability system (`Borrowed` / `BorrowedMut`)
+///   acts as a compile-time lock over the raw slots. Because `step_batched` strictly consumes
+///   `TickBatch` jobs containing disjoint `BorrowedMut` destination tokens, parallel threads
+///   (via Rayon) can safely execute unaliased concurrent writes to the underlying memory.
 unsafe impl Buffer for SimdBuffer {
     type Config = ();
     type Activity = SimdActivity;

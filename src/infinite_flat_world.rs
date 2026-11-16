@@ -47,7 +47,7 @@ struct RawInfiniteFlatWorld<B: Backend> {
     empty: OwnedOf<B>,
 }
 
-fn add(a: (i64, i64), b: (i64, i64)) -> (i64, i64) {
+const fn add(a: (i64, i64), b: (i64, i64)) -> (i64, i64) {
     (a.0 + b.0, a.1 + b.1)
 }
 
@@ -406,7 +406,7 @@ impl<B: Backend> InfiniteFlatWorld<B> {
 
     /// Returns the number of currently tracked (non-empty) chunks in the simulation.
     #[inline]
-    pub fn active_chunks(&self) -> usize {
+    pub const fn active_chunks(&self) -> usize {
         self.raw.nodes.len()
     }
 

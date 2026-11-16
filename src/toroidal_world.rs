@@ -99,12 +99,12 @@ impl<B: Backend> ToroidalWorld<B> {
     }
 
     #[inline]
-    pub fn h_chunks(&self) -> usize {
+    pub const fn h_chunks(&self) -> usize {
         self.h_chunks
     }
 
     #[inline]
-    pub fn v_chunks(&self) -> usize {
+    pub const fn v_chunks(&self) -> usize {
         self.v_chunks
     }
 
