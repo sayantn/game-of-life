@@ -1,6 +1,8 @@
 use std::ops::{Index, IndexMut};
 
+/// Cardinal (orthogonal) direction corresponding to the four borders of a square chunk.
 #[repr(u8)]
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Orth {
     N,
@@ -22,7 +24,9 @@ impl Orth {
     }
 }
 
+/// Eight-way compass direction (orthogonal and diagonal) to an adjacent chunk.
 #[repr(u8)]
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     NW,
@@ -53,6 +57,7 @@ impl Dir {
     }
 
     #[inline]
+    #[must_use]
     pub fn offset(self) -> (i64, i64) {
         match self {
             Dir::NW => (-1, 1),
@@ -82,6 +87,7 @@ impl Dir {
     }
 }
 
+/// Fixed-size container associating a value of type `T` with each of the 8 [`Dir`] neighbors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeighborData<T>([T; 8]);
 
@@ -119,6 +125,8 @@ impl<T> NeighborData<T> {
     }
 }
 
+/// 2D chunk-space grid coordinate `(x, y)` in an [`InfiniteFlatWorld`](crate::InfiniteFlatWorld).
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Coord {
     pub x: i64,

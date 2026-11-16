@@ -61,7 +61,7 @@ pub fn parse_chunk<C: Chunk>(s: &str) -> Result<C, ParseError> {
     let mut bytes = C::empty().to_bytes();
 
     let buf = bytes.as_mut();
-    assert_eq!(buf.len(), C::BYTES);
+    debug_assert_eq!(buf.len(), C::BYTES);
 
     let lines: Vec<&str> = s.lines().collect();
 
@@ -82,7 +82,11 @@ pub fn parse_chunk<C: Chunk>(s: &str) -> Result<C, ParseError> {
         });
     }
 
-    for (r, (line, row)) in lines.iter().zip(buf.chunks_exact_mut(C::SIZE)).enumerate() {
+    for (r, (line, row)) in lines
+        .iter()
+        .zip(buf.chunks_exact_mut(C::SIZE / 8))
+        .enumerate()
+    {
         // Check the width before indexing, so `col < width <= COLS` holds below.
         let len = line.chars().count();
         if len != width {
@@ -111,7 +115,7 @@ pub fn print_chunk<C: Chunk>(f: &mut fmt::Formatter<'_>, chunk: &C) -> fmt::Resu
     let bytes = chunk.to_bytes();
     let bytes = bytes.as_ref();
 
-    for row in bytes.chunks_exact(C::SIZE) {
+    for row in bytes.chunks_exact(C::SIZE / 8) {
         for (j, slot) in line[..C::SIZE].iter_mut().enumerate() {
             let bit = row[j / 8] & (0x80 >> (j % 8));
             *slot = if bit != 0 { b'#' } else { b'.' };

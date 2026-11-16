@@ -6,6 +6,13 @@ use rand::distr::{Distribution, StandardUniform};
 
 use crate::primitives::{NeighborData, Orth};
 
+pub type ChunkOf<B> = <B as Backend>::Chunk;
+pub type BytesOf<B> = <ChunkOf<B> as Chunk>::Bytes;
+pub type BufferOf<B> = <B as Backend>::Buffer;
+pub type ConfigOf<B> = <BufferOf<B> as Buffer>::Config;
+pub type OwnedOf<B> = <BufferOf<B> as Buffer>::Owned;
+pub type IdOf<'a, B> = <BufferOf<B> as Buffer>::Id<'a>;
+
 /// Defines a compute backend (e.g., AVX2 CPU, OpenCL GPU) by pairing a host-side chunk
 /// representation, its backing slot storage, and its native activity summary layout.
 pub trait Backend: 'static {
@@ -87,14 +94,15 @@ pub trait Owned: 'static {
     ///
     /// While the returned `Id<'a>` is live, Rust's borrow checker prevents mutating
     /// (`&mut Self`) or consuming (`self`) the underlying slot.
-    fn id<'a>(&'a self) -> Self::Id<'a>;
+    fn id(&self) -> Self::Id<'_>;
 }
 
 /// Low-level, fixed-slot-size backing storage for chunk data (e.g., a CPU `Vec<UnsafeCell<Chunk>>`
 /// or an OpenCL `cl_mem` buffer), decoupling physical memory management from `Arena<B>`'s
 /// free-list allocator.
 ///
-/// # Safety (Implementor Contract)
+/// # Safety
+///
 /// Implementations of `Buffer` must uphold the following invariants so callers can rely on
 /// type-level capability guarantees without runtime bounds checks or aliasing checks:
 ///
@@ -122,8 +130,7 @@ pub trait Owned: 'static {
 /// 4. **Interior Mutability & Thread Safety:**
 ///    - [`store`](Self::store), [`copy`](Self::copy), and [`compute_batched`](Self::compute_batched)
 ///      take `&self` and mutate the backing storage via interior mutability (or device command
-///      queues). Implementations must ensure disjoint slots can be safely read/written
-///      concurrently when `Self: Sync`.
+///      queues).
 pub unsafe trait Buffer: Sized + 'static {
     /// Backend-specific configuration or context required to initialize the buffer
     /// (e.g., `()` for CPU memory, or an OpenCL context/queue handle for GPU memory).
@@ -152,6 +159,7 @@ pub unsafe trait Buffer: Sized + 'static {
 
     /// Creates a new, empty buffer configured with the same backend context/parameters
     /// as `self`, without copying any existing chunks or minting any `Owned` tokens.
+    #[must_use]
     fn empty_clone(&self) -> Self;
 
     /// Returns the total number of slots currently allocated in this buffer.
@@ -167,7 +175,21 @@ pub unsafe trait Buffer: Sized + 'static {
     ///
     /// # Panics
     /// Panics if the new capacity overflows `usize` or fails to allocate.
-    fn grow(&mut self, additional: usize, out: &mut Vec<Self::Owned>);
+    fn grow(&mut self, additional: usize, out: &mut Vec<Self::Owned>) {
+        self.grow_exact(additional, out);
+    }
+
+    /// Grows the buffer's capacity to hold exactly `self.capacity() + additional` slots,
+    /// preserving all existing slots and appending all `new_cap - old_cap` newly minted
+    /// [`Owned`](Self::Owned) tokens to `out`.
+    ///
+    /// Like [`Vec::reserve`], the implementation may allocate more than `additional` slots
+    /// to amortize reallocation costs or align to backend-specific page/workgroup boundaries.
+    /// If `additional == 0`, this may be a no-op.
+    ///
+    /// # Panics
+    /// Panics if the new capacity overflows `usize` or fails to allocate.
+    fn grow_exact(&mut self, additional: usize, out: &mut Vec<Self::Owned>);
 
     /// Reads the chunk at `id` and returns an owned host copy.
     ///
@@ -175,6 +197,7 @@ pub unsafe trait Buffer: Sized + 'static {
     /// - `id` must have been minted by `self`.
     unsafe fn load(&self, id: Self::Id<'_>) -> Self::Chunk {
         let mut chunk = Self::Chunk::empty();
+        // SAFETY: Caller guarantees `id` was minted by `self`.
         unsafe { self.load_to(id, &mut chunk) };
         chunk
     }
@@ -209,19 +232,6 @@ pub unsafe trait Buffer: Sized + 'static {
         }
     }
 
-    /// Folds an arbitrary host function across all chunks in `ids`.
-    ///
-    /// On host backends, this inspects chunks directly in-place without copying.
-    /// On device backends, this streams chunks from device memory into a reusable scratch buffer.
-    ///
-    /// # Safety
-    /// Every `Id<'_>` in `ids` must have been minted by `self`.
-    unsafe fn num_alive_batched(&self, ids: &[Self::Id<'_>]) -> usize {
-        ids.iter()
-            .map(|&id| unsafe { self.load(id).num_alive() })
-            .sum()
-    }
-
     /// Copies the chunk at `src` (from `from`) into the slot `dst` (in `self`).
     ///
     /// # Safety
@@ -231,6 +241,8 @@ pub unsafe trait Buffer: Sized + 'static {
 
     /// Executes a batched Game of Life step across all alive and dead chunks in `batch`, writing
     /// resulting states into `alive_dsts` and `dead_dsts` and pushing [`Activity`] summaries to `out`.
+    /// This overwrites all cells of both `alive_dsts` and `dead_dsts`, and doesn't touch any chunk
+    /// other than the passed ones.
     ///
     /// # Panics
     /// Panics if `alive_dsts.len()` does not match `batch.alive_len()`, or if
@@ -253,13 +265,14 @@ pub unsafe trait Buffer: Sized + 'static {
 ///
 /// Recycled across ticks via [`recycle`](Self::recycle) to retain heap allocations
 /// without violating borrow-checker lifetimes.
+#[must_use]
 pub struct Batch<'a, B: Buffer> {
     alive_srcs: Vec<B::Id<'a>>,
     alive_nbhds: Vec<NeighborData<B::Id<'a>>>,
     dead_nbhds: Vec<NeighborData<B::Id<'a>>>,
 }
 
-impl<'a, B: Buffer> Default for Batch<'a, B> {
+impl<B: Buffer> Default for Batch<'_, B> {
     fn default() -> Self {
         Self::new()
     }
@@ -276,23 +289,31 @@ impl<'a, B: Buffer> Batch<'a, B> {
     }
 
     /// Returns the number of alive chunks queued in this batch.
+    #[must_use]
     pub fn alive_len(&self) -> usize {
         self.alive_srcs.len()
     }
 
     /// Returns the number of dead border chunks queued in this batch.
+    #[must_use]
     pub fn dead_len(&self) -> usize {
         self.dead_nbhds.len()
     }
 
+    /// Returns a slice of source [`Buffer::Id`]s for all queued active chunks.
+    #[must_use]
     pub fn alive_srcs(&self) -> &[B::Id<'a>] {
         &self.alive_srcs
     }
 
+    /// Returns a slice of 8-neighbor [`Buffer::Id`] tuples for all queued active chunks.
+    #[must_use]
     pub fn alive_nbhds(&self) -> &[NeighborData<B::Id<'a>>] {
         &self.alive_nbhds
     }
 
+    /// Returns a slice of 8-neighbor [`Buffer::Id`] tuples for all queued inactive border chunks.
+    #[must_use]
     pub fn dead_nbhds(&self) -> &[NeighborData<B::Id<'a>>] {
         &self.dead_nbhds
     }
@@ -317,6 +338,8 @@ impl<'a, B: Buffer> Batch<'a, B> {
     /// Clears all queued entries and rebinds the batch's lifetime parameter `'a` to `'b`,
     /// reusing the underlying `Vec` heap allocations across simulation steps.
     pub fn recycle<'b>(self) -> Batch<'b, B> {
+        // SAFETY: `B::Id<'a>` and `B::Id<'b>` are the same type constructor differing only in
+        // their erased borrow lifetime, and all vectors are cleared before reinterpreting.
         unsafe {
             Batch {
                 alive_srcs: recycle_vec(self.alive_srcs),
@@ -337,5 +360,7 @@ unsafe fn recycle_vec<T, U>(mut a: Vec<T>) -> Vec<U> {
 
     a.clear();
     let (ptr, len, cap) = a.into_raw_parts();
+    // SAFETY: `a` has length 0 (no initialized elements to drop or reinterpret), `T` and `U`
+    // have identical size and alignment, and `(ptr, 0, cap)` came directly from `Vec::into_raw_parts`.
     unsafe { Vec::from_raw_parts(ptr.cast(), len, cap) }
 }

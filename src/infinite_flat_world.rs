@@ -4,23 +4,24 @@ use std::mem;
 use fxhash::{FxHashMap, FxHashSet};
 
 use crate::{
-    Activity, Arena, Backend, Batch, Buffer, Coord, DefaultBackend, Dir, NeighborData, Orth, Owned,
+    Activity, Arena, Backend, Batch, Buffer, ConfigOf, Coord, DefaultBackend, Dir, NeighborData,
+    Orth, Owned, OwnedOf,
 };
 
 type Links = NeighborData<Option<usize>>;
 
-struct Node<B: Buffer> {
+struct Node<B: Backend> {
     coord: Coord,
-    chunk: B::Owned,
+    chunk: OwnedOf<B>,
     links: Links,
     activity: B::Activity,
 }
 
 struct RawInfiniteFlatWorld<B: Backend> {
-    arena: Arena<B::Buffer>,
-    nodes: Vec<Node<B::Buffer>>,
+    arena: Arena<B>,
+    nodes: Vec<Node<B>>,
     index: FxHashMap<Coord, usize>,
-    empty: <B::Buffer as Buffer>::Owned,
+    empty: OwnedOf<B>,
 }
 
 fn add(a: (i64, i64), b: (i64, i64)) -> (i64, i64) {
@@ -45,10 +46,11 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
             }
         }
 
+        // SAFETY: `self.empty` was allocated from `self.arena`.
         assert!(unsafe { self.arena.load(self.empty.id()).is_empty() });
     }
 
-    fn create(&mut self, coord: Coord, chunk: <B::Buffer as Buffer>::Owned, activity: B::Activity) {
+    fn create(&mut self, coord: Coord, chunk: OwnedOf<B>, activity: B::Activity) {
         let node_id = self.nodes.len();
 
         let links = Links::from_fn(|dir| self.index.get(&coord.step(dir)).copied());
@@ -77,7 +79,8 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
             }
         }
         self.index.remove(&coord);
-        self.arena.dealloc(self.nodes.swap_remove(node_id).chunk);
+        // SAFETY: `node.chunk` was allocated from `self.arena`.
+        unsafe { self.arena.dealloc(self.nodes.swap_remove(node_id).chunk) };
 
         // now we need to patch up the node that got replaced, only if it was not the last one
         let Some(&Node { coord, links, .. }) = self.nodes.get(node_id) else {
@@ -91,13 +94,15 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
         self.index.insert(coord, node_id);
     }
 
-    fn clock(&mut self, scratch: &mut Scratch<B::Buffer>) -> (usize, usize) {
+    fn clock(&mut self, scratch: &mut Scratch<B>) -> (usize, usize) {
         macro_rules! get_neighbors {
             ($links: expr) => {
                 $links.map(|neighbor| {
                     neighbor
-                        .map_or(&self.empty, |node_id| unsafe {
-                            &self.nodes.get_unchecked(node_id).chunk
+                        .map_or(&self.empty, |node_id| {
+                            // SAFETY: Graph invariant guarantees every `Some(node_id)` in `links`
+                            // is a valid index `< self.nodes.len()`.
+                            unsafe { &self.nodes.get_unchecked(node_id).chunk }
                         })
                         .id()
                 })
@@ -147,14 +152,17 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
             }
         }
 
+        // SAFETY: Every ID in `batch` belongs to `self.empty` or a live node in `self.nodes`
+        // (all allocated from `self.arena`), and every destination in `alive_dsts` and `dead_dsts`
+        // was freshly allocated from `self.arena`.
         unsafe {
             self.arena.compute_batched(
                 &batch,
                 &mut scratch.alive_dsts,
                 &mut scratch.dead_dsts,
                 &mut scratch.results_buf,
-            )
-        };
+            );
+        }
 
         let (alive_chunks_checked, dead_chunks_checked) =
             (scratch.alive_dsts.len(), scratch.dead_dsts.len());
@@ -169,11 +177,14 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
         .rev()
         {
             if activity.chunk() {
+                // SAFETY: Iterating `0..self.nodes.len()` in reverse; `self.nodes` has not been modified yet.
                 let node = unsafe { self.nodes.get_unchecked_mut(node_id) };
-                self.arena.dealloc(mem::replace(&mut node.chunk, chunk));
+                // SAFETY: The replaced `node.chunk` was allocated from `self.arena`.
+                unsafe { self.arena.dealloc(mem::replace(&mut node.chunk, chunk)) };
                 node.activity = activity;
             } else {
-                self.arena.dealloc(chunk);
+                // SAFETY: `chunk` was allocated from `self.arena`.
+                unsafe { self.arena.dealloc(chunk) };
                 self.destroy(node_id);
             }
         }
@@ -185,7 +196,8 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
             if activity.chunk() {
                 self.create(coord, chunk, activity);
             } else {
-                self.arena.dealloc(chunk);
+                // SAFETY: `chunk` was allocated from `self.arena`.
+                unsafe { self.arena.dealloc(chunk) };
             }
         }
 
@@ -196,36 +208,80 @@ impl<B: Backend> RawInfiniteFlatWorld<B> {
     }
 }
 
-struct Scratch<B: Buffer> {
+impl<B: Backend> Clone for RawInfiniteFlatWorld<B> {
+    fn clone_from(&mut self, source: &Self) {
+        for node in self.nodes.drain(..) {
+            // SAFETY: `node.chunk` was allocated from `self.arena`.
+            unsafe { self.arena.dealloc(node.chunk) };
+        }
+
+        self.nodes.extend(source.nodes.iter().map(|node| {
+            let mut new_chunk = self.arena.alloc();
+            // SAFETY: `new_chunk` was minted by `self.arena` and `node.chunk` was minted by `source.arena`.
+            unsafe {
+                self.arena
+                    .copy(&mut new_chunk, &source.arena, node.chunk.id());
+            }
+
+            Node {
+                coord: node.coord,
+                chunk: new_chunk,
+                links: node.links,
+                activity: node.activity,
+            }
+        }));
+        self.index.clone_from(&source.index);
+    }
+
+    fn clone(&self) -> Self {
+        let mut new_arena = self.arena.empty_clone();
+        let mut dst = RawInfiniteFlatWorld {
+            empty: new_arena.alloc(),
+            arena: new_arena,
+            nodes: Vec::new(),
+            index: FxHashMap::default(),
+        };
+        dst.clone_from(self);
+        dst
+    }
+}
+
+struct Scratch<B: Backend> {
     checked: FxHashSet<Coord>,
     coords_buf: Vec<Coord>,
-    batch: Batch<'static, B>,
-    alive_dsts: Vec<B::Owned>,
-    dead_dsts: Vec<B::Owned>,
+    batch: Batch<'static, B::Buffer>,
+    alive_dsts: Vec<OwnedOf<B>>,
+    dead_dsts: Vec<OwnedOf<B>>,
     results_buf: Vec<B::Activity>,
 }
 
-impl<B: Buffer> Default for Scratch<B> {
+impl<B: Backend> Default for Scratch<B> {
     fn default() -> Self {
         Self {
-            checked: Default::default(),
-            coords_buf: Default::default(),
-            batch: Default::default(),
-            alive_dsts: Default::default(),
-            dead_dsts: Default::default(),
-            results_buf: Default::default(),
+            checked: FxHashSet::default(),
+            coords_buf: Vec::default(),
+            batch: Batch::default(),
+            alive_dsts: Vec::default(),
+            dead_dsts: Vec::default(),
+            results_buf: Vec::default(),
         }
     }
 }
 
+/// Sparse, unbounded 2D Game of Life simulation engine backed by [`Backend`] `B`.
+///
+/// Tracks only active chunks in an adjacency-linked graph and uses [`Activity`] border flags
+/// to dynamically allocate neighbor chunks when live cells reach a boundary and reclaim
+/// chunks once they become completely dead.
 pub struct InfiniteFlatWorld<B: Backend = DefaultBackend> {
     raw: RawInfiniteFlatWorld<B>,
-    scratch: Scratch<B::Buffer>,
+    scratch: Scratch<B>,
 }
 
 impl<B: Backend> InfiniteFlatWorld<B> {
-    pub fn empty(config: <B::Buffer as Buffer>::Config) -> Self {
-        let mut arena = Arena::<B::Buffer>::new(config);
+    /// Creates an empty infinite world with no active chunks.
+    pub fn empty(config: ConfigOf<B>) -> Self {
+        let mut arena = Arena::<B>::new(config);
         Self {
             raw: RawInfiniteFlatWorld {
                 empty: arena.alloc_zeroed(),
@@ -233,14 +289,16 @@ impl<B: Backend> InfiniteFlatWorld<B> {
                 nodes: Vec::new(),
                 index: FxHashMap::default(),
             },
-            scratch: Scratch::<B::Buffer>::default(),
+            scratch: Scratch::default(),
         }
     }
 
-    pub fn insert_chunk(&mut self, coord: Coord, chunk: B::Chunk) {
+    /// Inserts or overwrites the chunk at chunk coordinates `coord`, marking all borders active.
+    pub fn insert_chunk(&mut self, coord: Coord, chunk: &B::Chunk) {
         if let Some(&node_id) = self.raw.index.get(&coord) {
             let node = &mut self.raw.nodes[node_id];
-            unsafe { self.raw.arena.store(&mut node.chunk, &chunk) };
+            // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
+            unsafe { self.raw.arena.store(&mut node.chunk, chunk) };
             node.activity = Activity::ALL;
         } else {
             let chunk = self.raw.arena.own(chunk);
@@ -248,31 +306,39 @@ impl<B: Backend> InfiniteFlatWorld<B> {
         }
     }
 
+    /// Returns a host copy of the chunk at `coord`, or `None` if that chunk is currently inactive.
     pub fn load_chunk(&self, coord: Coord) -> Option<B::Chunk> {
-        Some(unsafe {
-            self.raw
-                .arena
-                .load(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.id())
-        })
+        Some(
+            // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
+            unsafe {
+                self.raw
+                    .arena
+                    .load(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.id())
+            },
+        )
     }
 
+    /// Copies the chunk at `coord` into `dst`, returning `None` if that chunk is inactive.
     pub fn load_chunk_to<'a>(
         &self,
         coord: Coord,
         dst: &'a mut B::Chunk,
     ) -> Option<&'a mut B::Chunk> {
+        // SAFETY: `node.chunk` was allocated from `self.raw.arena`.
         unsafe {
             self.raw
                 .arena
-                .load_to(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.id(), dst)
-        };
+                .load_to(self.raw.nodes[*self.raw.index.get(&coord)?].chunk.id(), dst);
+        }
         Some(dst)
     }
 
+    /// Returns the number of currently tracked (non-empty) chunks in the simulation.
     pub fn active_chunks(&self) -> usize {
         self.raw.nodes.len()
     }
 
+    /// Advances the simulation by one generation, returning `(alive_chunks_stepped, border_chunks_checked)`.
     pub fn clock(&mut self) -> (usize, usize) {
         self.raw.clock(&mut self.scratch)
     }
@@ -280,34 +346,14 @@ impl<B: Backend> InfiniteFlatWorld<B> {
 
 impl<B: Backend> Clone for InfiniteFlatWorld<B> {
     fn clone(&self) -> Self {
-        let mut new_arena = self.raw.arena.empty_clone();
-
-        let new_nodes = self
-            .raw
-            .nodes
-            .iter()
-            .map(|node| {
-                let mut new_chunk = new_arena.alloc();
-                unsafe { new_arena.copy(&mut new_chunk, &self.raw.arena, node.chunk.id()) };
-
-                Node {
-                    coord: node.coord,
-                    chunk: new_chunk,
-                    links: node.links,
-                    activity: node.activity,
-                }
-            })
-            .collect();
-
         Self {
-            raw: RawInfiniteFlatWorld {
-                empty: new_arena.alloc_zeroed(),
-                arena: new_arena,
-                nodes: new_nodes,
-                index: self.raw.index.clone(),
-            },
+            raw: self.raw.clone(),
             scratch: Scratch::default(),
         }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.raw.clone_from(&source.raw);
     }
 }
 
@@ -337,7 +383,7 @@ mod tests {
             let new_chunk = NewChunk::from_bytes(&rng.random());
             let old_chunk = OldChunk::from_bytes(new_chunk.to_bytes());
 
-            new_world.insert_chunk(Coord { x: cx, y: cy }, new_chunk);
+            new_world.insert_chunk(Coord { x: cx, y: cy }, &new_chunk);
             old_world
                 .active_chunks
                 .insert((cx as i128, cy as i128), old_chunk);

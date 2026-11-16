@@ -27,7 +27,7 @@ pub struct SimdOwned(usize);
 impl Owned for SimdOwned {
     type Id<'a> = SimdId<'a>;
 
-    fn id<'a>(&'a self) -> Self::Id<'a> {
+    fn id(&self) -> Self::Id<'_> {
         SimdId(self.0, PhantomData)
     }
 }
@@ -45,15 +45,17 @@ pub struct SimdBuffer {
 }
 
 impl SimdBuffer {
-    #[inline(always)]
+    #[inline]
     unsafe fn get<'a>(&'a self, id: SimdId<'a>) -> &'a SimdChunk {
-        // SAFETY: Caller guarantees `id` was minted by `self` and no mutable borrow exists.
+        // SAFETY: Caller guarantees `id` was minted by `self` (so `id.0 < self.chunks.len()`)
+        // and no mutable reference to slot `id.0` exists while `id` is live.
         unsafe { &*self.chunks.get_unchecked(id.0).get() }
     }
 
-    #[inline(always)]
+    #[inline]
     unsafe fn get_mut<'a>(&'a self, owned: &'a mut SimdOwned) -> &'a mut SimdChunk {
-        // SAFETY: Caller guarantees `owned` was minted by `self` and is uniquely borrowed.
+        // SAFETY: Caller guarantees `owned` was minted by `self` (so `owned.0 < self.chunks.len()`)
+        // and `&mut SimdOwned` guarantees exclusive access to slot `owned.0`.
         unsafe { &mut *self.chunks.get_unchecked(owned.0).get() }
     }
 }
@@ -96,6 +98,24 @@ unsafe impl Buffer for SimdBuffer {
         out.extend((old_cap..new_cap).rev().map(SimdOwned));
     }
 
+    fn grow_exact(&mut self, additional: usize, out: &mut Vec<Self::Owned>) {
+        if additional == 0 {
+            return;
+        }
+
+        let old_cap = self.chunks.len();
+        self.chunks.reserve_exact(additional);
+        // Expand up to the full amortized `Vec` capacity so subsequent growths are rare.
+        let new_cap = self.chunks.capacity();
+
+        self.chunks
+            .resize_with(new_cap, || SyncUnsafeCell::new(SimdChunk::empty()));
+
+        // Push in reverse so `Vec::pop` hands out sequential indices `old_cap..new_cap`.
+        out.reserve(new_cap - old_cap);
+        out.extend((old_cap..new_cap).rev().map(SimdOwned));
+    }
+
     #[inline]
     unsafe fn load_to(&self, id: Self::Id<'_>, dst: &mut Self::Chunk) {
         // SAFETY: Caller guarantees `id` was minted by `self`.
@@ -126,7 +146,11 @@ unsafe impl Buffer for SimdBuffer {
 
         let total_len = alive_dsts.len() + dead_dsts.len();
 
-        if cfg!(feature = "parallel") && total_len >= 128 {
+        // SAFETY: Caller guarantees all source/neighbor IDs and destination `Owned` handles were
+        // minted by `self`, and the capability rules ensure no destination slot aliases any input
+        // or other destination slot.
+
+        if cfg!(feature = "parallel") && total_len >= 32 {
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;

@@ -44,6 +44,7 @@ impl Chunk for SimdChunk {
 
     fn is_empty(&self) -> bool {
         for block in self.data.as_chunks::<16>().0 {
+            // SAFETY: Each chunk from `as_chunks::<16>()` has length 16, so the iterator is non-empty.
             let acc = unsafe { block.iter().copied().reduce(Row::bitor).unwrap_unchecked() };
             if acc != empty_row() {
                 return false;
@@ -55,6 +56,8 @@ impl Chunk for SimdChunk {
 
 impl From<[u8; ROW_BYTES * ROW_BITS]> for SimdChunk {
     fn from(value: [u8; ROW_BYTES * ROW_BITS]) -> Self {
+        // SAFETY: `[u8; ROW_BYTES * ROW_BITS]` and `[[u8; ROW_BYTES]; ROW_BITS]` have identical
+        // size, alignment (1), and bit validity.
         let bytes: [[u8; ROW_BYTES]; ROW_BITS] = unsafe { mem::transmute(value) };
         Self::new(bytes.map(row_from_bytes))
     }
@@ -62,6 +65,8 @@ impl From<[u8; ROW_BYTES * ROW_BITS]> for SimdChunk {
 
 impl From<SimdChunk> for [u8; ROW_BYTES * ROW_BITS] {
     fn from(value: SimdChunk) -> Self {
+        // SAFETY: `[[u8; ROW_BYTES]; ROW_BITS]` and `[u8; ROW_BYTES * ROW_BITS]` have identical
+        // size, alignment (1), and bit validity.
         unsafe { mem::transmute(value.data.map(row_to_bytes)) }
     }
 }

@@ -180,6 +180,8 @@ cfg_select! {
 
                 #[inline]
                 fn shld1(a: Row, b: Row) -> Row {
+                    // SAFETY: `Row` (`u64x2`) and `vector_unsigned_long_long` are identical 128-bit vector types,
+                    // and target feature `vector-enhancements-2` is enabled by the enclosing `cfg_select!` guard.
                     unsafe {
                         transmute(vec_sldb::<vector_unsigned_long_long, 1>(
                             transmute(a),
@@ -190,6 +192,8 @@ cfg_select! {
 
                 #[inline]
                 fn shrd1(a: Row, b: Row) -> Row {
+                    // SAFETY: `Row` (`u64x2`) and `vector_unsigned_long_long` are identical 128-bit vector types,
+                    // and target feature `vector-enhancements-2` is enabled by the enclosing `cfg_select!` guard.
                     unsafe {
                         transmute(vec_srdb::<vector_unsigned_long_long, 1>(
                             transmute(a),
@@ -211,6 +215,8 @@ cfg_select! {
                 fn shld1(a: Row, b: Row) -> Row {
                     let a = a.into();
                     let b = b.into();
+                    // SAFETY: `lasx_xvshuf4i_d`, `lasx_xvpermi_q`, `lasx_xvor_v`, `lasx_xvslli_d`, and
+                    // `lasx_xvsrli_d` are pure value-to-value SIMD register intrinsics guarded by `target_feature = "lasx"`.
                     unsafe {
                         let carry_lanes = lasx_xvshuf4i_d::<0x33>(a, lasx_xvpermi_q::<0x03>(a, b));
                         lasx_xvor_v(lasx_xvslli_d::<1>(a), lasx_xvsrli_d::<63>(carry_lanes)).into()
@@ -221,6 +227,8 @@ cfg_select! {
                 fn shrd1(a: Row, b: Row) -> Row {
                     let a = a.into();
                     let b = b.into();
+                    // SAFETY: `lasx_xvshuf4i_d`, `lasx_xvpermi_q`, `lasx_xvor_v`, `lasx_xvslli_d`, and
+                    // `lasx_xvsrli_d` are pure value-to-value SIMD register intrinsics guarded by `target_feature = "lasx"`.
                     unsafe {
                         let carry_lanes = lasx_xvshuf4i_d::<0x99>(b, lasx_xvpermi_q::<0x03>(a, b));
                         lasx_xvor_v(lasx_xvsrli_d::<1>(b), lasx_xvslli_d::<63>(carry_lanes)).into()

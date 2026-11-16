@@ -11,12 +11,12 @@
     feature(stdarch_loongarch)
 )]
 #![allow(
-    clippy::must_use_candidate,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::wildcard_imports,
-    clippy::return_self_not_must_use
+    clippy::doc_markdown
 )]
+#![deny(clippy::missing_safety_doc)]
 
 pub mod arena;
 pub mod backend;
@@ -32,6 +32,8 @@ pub use infinite_flat_world::InfiniteFlatWorld;
 pub use primitives::*;
 pub use toroidal_world::ToroidalWorld;
 pub use traits::*;
+
+pub type DefaultChunk = ChunkOf<DefaultBackend>;
 
 #[allow(unused)]
 #[cfg(test)]
