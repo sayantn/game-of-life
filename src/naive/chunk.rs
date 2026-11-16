@@ -78,6 +78,14 @@ impl NaiveChunk {
         chunk
     }
 
+    pub fn num_alive(&self) -> usize {
+        self.data
+            .iter()
+            .flat_map(|iter| iter)
+            .filter(|&&cell| cell == Cell::Alive)
+            .count()
+    }
+
     pub fn toggle(&mut self, x: usize, y: usize) {
         self.data[x][y] ^= Cell::Alive;
     }
@@ -359,16 +367,22 @@ impl NaiveChunk {
 
 impl Display for NaiveChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for y in (0..SIZE_Y).rev() {
-            f.write_char('\n')?;
-            for x in 0..SIZE_X {
-                f.write_char(match self[(x, y)] {
-                    Dead => '.',
-                    Alive => '#',
-                })?
+        if f.alternate() {
+            for y in (0..SIZE_Y).rev() {
+                f.write_char('\n')?;
+                for x in 0..SIZE_X {
+                    f.write_char(match self[(x, y)] {
+                        Dead => '.',
+                        Alive => '#',
+                    })?
+                }
             }
+            Ok(())
+        } else {
+            f.debug_struct("Chunk")
+                .field("population", &self.num_alive())
+                .finish()
         }
-        Ok(())
     }
 }
 

@@ -25,7 +25,7 @@ pub struct Chunk([u8; Self::BYTES]);
 
 impl Chunk {
     /// The width and height of the chunk in cells. MUST be 256.
-    pub const SIZE: usize = 128;
+    pub const SIZE: usize = 256;
     /// The number of bytes required to store a single row (32 bytes).
     pub const ROW_BYTES: usize = Self::SIZE / 8;
     /// The total number of bytes required to store the chunk (8192 bytes).
@@ -146,11 +146,11 @@ impl std::fmt::Debug for Chunk {
         // If the alternate flag is used ({:#?}), print the population summary instead
         // of blasting a 256x256 grid to the terminal.
         if f.alternate() {
+            print_chunk(f, self)
+        } else {
             f.debug_struct("Chunk")
                 .field("population", &self.population())
                 .finish()
-        } else {
-            print_chunk(f, self)
         }
     }
 }
