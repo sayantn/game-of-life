@@ -1,52 +1,50 @@
-use std::fmt::Debug;
 use std::iter::zip;
 
 use crate::{Activity, Chunk, Dir, NeighborData, Orth};
 
 use super::row::*;
 
-const SIZE: usize = ROW_BITS;
-
-const _: () = assert!(ROW_BITS == Chunk::SIZE);
+pub(crate) const REGS_PER_CHUNK: usize = 256 / ROWS_PER_REG;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SimdChunk {
-    data: [Row; ROW_BITS],
+    data: [Reg; REGS_PER_CHUNK],
 }
 
 impl SimdChunk {
     #[allow(clippy::large_types_passed_by_value)]
-    const fn new(data: [Row; ROW_BITS]) -> Self {
+    const fn new(data: [Reg; REGS_PER_CHUNK]) -> Self {
         Self { data }
     }
-}
 
-impl SimdChunk {
     #[inline]
     pub(super) const fn empty() -> Self {
-        Self::new([empty_row(); _])
+        Self::new([empty_reg(); REGS_PER_CHUNK])
     }
 
+    #[inline]
     pub(super) fn convert_into(&self, dst: &mut Chunk) {
-        for (src, dst) in zip(self.data, dst.as_rows_mut()) {
-            *dst = row_to_bytes(src);
+        for (src, dst_bytes) in zip(self.data, dst.as_bytes_mut().chunks_exact_mut(REG_BYTES)) {
+            dst_bytes.copy_from_slice(&reg_to_bytes(src));
         }
     }
 }
 
 impl Chunk {
+    #[inline]
     pub(super) fn convert_into(&self, dst: &mut SimdChunk) {
-        for (src, dst) in zip(self.as_rows(), &mut dst.data) {
-            *dst = row_from_bytes(*src);
+        for (src_bytes, dst_reg) in zip(self.as_bytes().chunks_exact(REG_BYTES), &mut dst.data) {
+            *dst_reg = reg_from_bytes(src_bytes.try_into().unwrap());
         }
     }
 }
 
-fn compute_activity(acc: Row, top_row: Row, bottom_row: Row) -> SimdActivity {
+#[inline]
+fn compute_activity(acc: Reg, top_reg: Reg, bottom_reg: Reg) -> SimdActivity {
     SimdActivity {
-        chunk: acc != empty_row(),
-        top: top_row != empty_row(),
-        bottom: bottom_row != empty_row(),
+        chunk: acc != empty_reg(),
+        top: is_top_row_active(top_reg),
+        bottom: is_bottom_row_active(bottom_reg),
         left_right: edge_cols(acc),
     }
 }
@@ -90,6 +88,37 @@ impl Activity for SimdActivity {
     }
 }
 
+// Applies vertical lane shifts directly to the cached sums to avoid redundant bitwise math
+#[inline]
+fn shift_digest_north(curr: RegDigest, south: RegDigest) -> RegDigest {
+    RegDigest {
+        reg: shift_regs_north(curr.reg, south.reg),
+        doublet: (
+            shift_regs_north(curr.doublet.0, south.doublet.0),
+            shift_regs_north(curr.doublet.1, south.doublet.1),
+        ),
+        triplet: (
+            shift_regs_north(curr.triplet.0, south.triplet.0),
+            shift_regs_north(curr.triplet.1, south.triplet.1),
+        ),
+    }
+}
+
+#[inline]
+fn shift_digest_south(curr: RegDigest, north: RegDigest) -> RegDigest {
+    RegDigest {
+        reg: shift_regs_south(curr.reg, north.reg),
+        doublet: (
+            shift_regs_south(curr.doublet.0, north.doublet.0),
+            shift_regs_south(curr.doublet.1, north.doublet.1),
+        ),
+        triplet: (
+            shift_regs_south(curr.triplet.0, north.triplet.0),
+            shift_regs_south(curr.triplet.1, north.triplet.1),
+        ),
+    }
+}
+
 #[inline]
 pub(super) fn apply_rules(
     center: &SimdChunk,
@@ -99,47 +128,53 @@ pub(super) fn apply_rules(
     let left = &nbhd[Dir::W].data;
     let right = &nbhd[Dir::E].data;
 
-    let mut top_row = RowDigest::new(
-        nbhd[Dir::N].data[SIZE - 1],
-        nbhd[Dir::NW].data[SIZE - 1],
-        nbhd[Dir::NE].data[SIZE - 1],
+    let mut prev_digest = RegDigest::new(
+        nbhd[Dir::N].data[REGS_PER_CHUNK - 1],
+        nbhd[Dir::NW].data[REGS_PER_CHUNK - 1],
+        nbhd[Dir::NE].data[REGS_PER_CHUNK - 1],
     );
-    let mut current_row = RowDigest::new(center.data[0], left[0], right[0]);
+    let mut curr_digest = RegDigest::new(center.data[0], left[0], right[0]);
 
-    let mut acc = empty_row();
+    let mut acc = empty_reg();
 
-    for i in 0..SIZE - 1 {
-        let bottom_row = RowDigest::new(center.data[i + 1], left[i + 1], right[i + 1]);
+    for i in 0..REGS_PER_CHUNK {
+        let next_center = if i + 1 < REGS_PER_CHUNK {
+            center.data[i + 1]
+        } else {
+            nbhd[Dir::S].data[0]
+        };
+        let next_left = if i + 1 < REGS_PER_CHUNK {
+            left[i + 1]
+        } else {
+            nbhd[Dir::SW].data[0]
+        };
+        let next_right = if i + 1 < REGS_PER_CHUNK {
+            right[i + 1]
+        } else {
+            nbhd[Dir::SE].data[0]
+        };
+
+        // 1 digest calculation per loop instead of 3
+        let next_digest = RegDigest::new(next_center, next_left, next_right);
+
+        let top_digest = shift_digest_south(curr_digest, prev_digest);
+        let bottom_digest = shift_digest_north(curr_digest, next_digest);
+
         let result = rule(
-            top_row.triplet,
-            current_row.doublet,
-            bottom_row.triplet,
-            current_row.row,
+            top_digest.triplet,
+            curr_digest.doublet,
+            bottom_digest.triplet,
+            curr_digest.reg,
         );
-        dst.data[i] = result;
 
+        dst.data[i] = result;
         acc |= result;
 
-        top_row = current_row;
-        current_row = bottom_row;
+        prev_digest = curr_digest;
+        curr_digest = next_digest;
     }
 
-    let bottom_row = RowDigest::new(
-        nbhd[Dir::S].data[0],
-        nbhd[Dir::SW].data[0],
-        nbhd[Dir::SE].data[0],
-    );
-    let result = rule(
-        top_row.triplet,
-        current_row.doublet,
-        bottom_row.triplet,
-        current_row.row,
-    );
-    dst.data[SIZE - 1] = result;
-
-    acc |= result;
-
-    compute_activity(acc, dst.data[0], result)
+    compute_activity(acc, dst.data[0], dst.data[REGS_PER_CHUNK - 1])
 }
 
 #[inline]
@@ -147,41 +182,51 @@ pub(super) fn check_activity(nbhd: NeighborData<&SimdChunk>, dst: &mut SimdChunk
     let left = &nbhd[Dir::W].data;
     let right = &nbhd[Dir::E].data;
 
-    let mut top_row = RowDigest::new(
-        nbhd[Dir::N].data[SIZE - 1],
-        nbhd[Dir::NW].data[SIZE - 1],
-        nbhd[Dir::NE].data[SIZE - 1],
+    let mut prev_digest = RegDigest::new(
+        nbhd[Dir::N].data[REGS_PER_CHUNK - 1],
+        nbhd[Dir::NW].data[REGS_PER_CHUNK - 1],
+        nbhd[Dir::NE].data[REGS_PER_CHUNK - 1],
     );
-    let mut current_row = RowDigest::new(empty_row(), left[0], right[0]);
-    let mut acc = empty_row();
+    let mut curr_digest = RegDigest::new(empty_reg(), left[0], right[0]);
 
-    for i in 0..SIZE - 1 {
-        let bottom_row = RowDigest::new(empty_row(), left[i + 1], right[i + 1]);
+    let mut acc = empty_reg();
+
+    for i in 0..REGS_PER_CHUNK {
+        // FIXED: Next center correctly pulls from the South neighbor's top row at the boundary
+        let next_center = if i + 1 < REGS_PER_CHUNK {
+            empty_reg()
+        } else {
+            nbhd[Dir::S].data[0]
+        };
+        let next_left = if i + 1 < REGS_PER_CHUNK {
+            left[i + 1]
+        } else {
+            nbhd[Dir::SW].data[0]
+        };
+        let next_right = if i + 1 < REGS_PER_CHUNK {
+            right[i + 1]
+        } else {
+            nbhd[Dir::SE].data[0]
+        };
+
+        let next_digest = RegDigest::new(next_center, next_left, next_right);
+
+        let top_digest = shift_digest_south(curr_digest, prev_digest);
+        let bottom_digest = shift_digest_north(curr_digest, next_digest);
+
         let result = rule(
-            top_row.triplet,
-            current_row.doublet,
-            bottom_row.triplet,
-            current_row.row,
+            top_digest.triplet,
+            curr_digest.doublet,
+            bottom_digest.triplet,
+            curr_digest.reg, // Always evaluates to empty_reg() for vacant chunks
         );
+
         dst.data[i] = result;
         acc |= result;
-        top_row = current_row;
-        current_row = bottom_row;
+
+        prev_digest = curr_digest;
+        curr_digest = next_digest;
     }
 
-    let bottom_row = RowDigest::new(
-        nbhd[Dir::S].data[0],
-        nbhd[Dir::SW].data[0],
-        nbhd[Dir::SE].data[0],
-    );
-    let result = rule(
-        top_row.triplet,
-        current_row.doublet,
-        bottom_row.triplet,
-        current_row.row,
-    );
-    dst.data[SIZE - 1] = result;
-    acc |= result;
-
-    compute_activity(acc, dst.data[0], result)
+    compute_activity(acc, dst.data[0], dst.data[REGS_PER_CHUNK - 1])
 }
